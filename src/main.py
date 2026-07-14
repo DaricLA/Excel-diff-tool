@@ -1,9 +1,7 @@
 """
-Excel 差异对比工具（最终优化版）
-- 修复：填充色比较使用 RGB 值，避免主题色误判
-- 增强：富文本局部格式差异详细描述
-- 界面：紧凑布局，开始按钮蓝底白字加粗，左侧对齐
-- 字体：全局微软雅黑
+Excel 差异对比工具（最终修复版）
+- 移除 ConditionalFormattingList 导入，使用内置 clear 方法
+- 其他功能保持不变
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -18,7 +16,6 @@ from openpyxl.comments import Comment
 from openpyxl.utils import column_index_from_string
 from openpyxl.cell.cell import MergedCell
 from openpyxl.cell.rich_text import CellRichText
-from openpyxl.worksheet.conditional_formatting import ConditionalFormattingList
 
 # ---------------------------- 核心对比引擎 ----------------------------
 class ExcelDiffEngine:
@@ -60,13 +57,13 @@ class ExcelDiffEngine:
             if has_diff or has_dim_diff or has_cf_diff:
                 self.stats['sheets_with_diff'].add(sheet_name)
 
-        # 删除无任何差异的工作表
+        # 删除无差异工作表
         for name in list(result_wb.sheetnames):
             if name not in self.stats['sheets_with_diff'] and name != "差异汇总" and name != "已删除的Sheet":
                 del result_wb[name]
                 self.log(f"删除无差异工作表: {name}")
 
-        # 强制所有注释可见
+        # 强制注释可见
         for ws in result_wb.worksheets:
             for row in ws.iter_rows():
                 for cell in row:
@@ -163,8 +160,6 @@ class ExcelDiffEngine:
 
     def _describe_diffs(self, old_cell, new_cell, old_ws, new_ws):
         diffs = []
-
-        # 1. 值/富文本差异
         if not self._value_equal(old_cell.value, new_cell.value):
             old_rich = isinstance(old_cell.value, CellRichText)
             new_rich = isinstance(new_cell.value, CellRichText)
@@ -176,7 +171,6 @@ class ExcelDiffEngine:
             else:
                 diffs.append(f"值: {self._format_value(old_cell.value)} → {self._format_value(new_cell.value)}")
 
-        # 2. 字体
         if not self._font_equal(old_cell.font, new_cell.font):
             f = []
             if old_cell.font.name != new_cell.font.name:
@@ -194,11 +188,9 @@ class ExcelDiffEngine:
             if f:
                 diffs.append("字体: " + "; ".join(f))
 
-        # 3. 填充色
         if not self._fill_equal(old_cell.fill, new_cell.fill):
             diffs.append("填充色/背景变更")
 
-        # 4. 边框（详细）
         if not self._border_equal(old_cell.border, new_cell.border):
             detail = []
             for side in ['left', 'right', 'top', 'bottom']:
@@ -210,7 +202,6 @@ class ExcelDiffEngine:
             if detail:
                 diffs.append("边框: " + "; ".join(detail))
 
-        # 5. 对齐
         if not self._alignment_equal(old_cell.alignment, new_cell.alignment):
             a = []
             if old_cell.alignment.horizontal != new_cell.alignment.horizontal:
@@ -222,11 +213,9 @@ class ExcelDiffEngine:
             if a:
                 diffs.append("对齐: " + "; ".join(a))
 
-        # 6. 数字格式
         if old_cell.number_format != new_cell.number_format:
             diffs.append(f"数字格式: {old_cell.number_format}→{new_cell.number_format}")
 
-        # 7. 合并状态
         old_m = self._cell_is_merged(old_ws, old_cell.row, old_cell.column)
         new_m = self._cell_is_merged(new_ws, new_cell.row, new_cell.column)
         if old_m != new_m:
@@ -237,23 +226,17 @@ class ExcelDiffEngine:
         return "【与旧版差异】\n" + "\n".join(diffs)
 
     def _rich_text_diff(self, old_val, new_val):
-        """生成富文本差异的详细说明"""
         if not isinstance(old_val, CellRichText):
             old_val = CellRichText(old_val if old_val is not None else "")
         if not isinstance(new_val, CellRichText):
             new_val = CellRichText(new_val if new_val is not None else "")
-
-        # 比较纯文本
         old_plain = str(old_val)
         new_plain = str(new_val)
         if old_plain != new_plain:
             return f"内容(含局部格式): {old_plain} → {new_plain}"
-
-        # 文本相同，比较局部格式
         lines = []
         for i, (t1, t2) in enumerate(zip(old_val, new_val)):
             if t1.text != t2.text or not self._font_equal(t1.font, t2.font):
-                # 详细列出第几段文字
                 segment = t1.text if t1.text else "(空)"
                 changes = []
                 if t1.font.name != t2.font.name:
@@ -276,7 +259,6 @@ class ExcelDiffEngine:
             lines.append("局部格式有细微变化")
         return "富文本局部格式变更:\n" + "\n".join(lines)
 
-    # ---------- 辅助方法 ----------
     @staticmethod
     def _value_equal(v1, v2):
         if type(v1) != type(v2):
@@ -302,20 +284,17 @@ class ExcelDiffEngine:
 
     @staticmethod
     def _get_font_color(font):
-        """获取字体颜色RGB值，处理主题颜色等特殊情况"""
         if font.color is None:
             return None
         try:
             return font.color.rgb
         except AttributeError:
-            # 可能是主题颜色，返回其索引或字符串表示
             return str(font.color)
 
     @staticmethod
     def _fill_equal(f1, f2):
         if f1.fill_type != f2.fill_type:
             return False
-        # 比较前景色和背景色的 RGB 值
         def get_rgb(fill, attr):
             color = getattr(fill, attr)
             if color is None:
@@ -354,7 +333,6 @@ class ExcelDiffEngine:
                 return True
         return False
 
-    # ---------- 合并单元格 ----------
     def _compare_merged_cells(self, old_ws, new_ws, result_ws):
         old = set(old_ws.merged_cells.ranges)
         new = set(new_ws.merged_cells.ranges)
@@ -365,7 +343,6 @@ class ExcelDiffEngine:
             self._add_comment(cell, "【新增合并区域】")
         return len(added) > 0 or len(old - new) > 0
 
-    # ---------- 行高列宽 ----------
     def _compare_row_col_dimensions(self, old_ws, new_ws, result_ws):
         changed = False
         for row_idx in old_ws.row_dimensions:
@@ -396,7 +373,6 @@ class ExcelDiffEngine:
                     self._add_comment(result_ws.cell(row=1, column=col), f"列宽新设置: {nw}")
         return changed
 
-    # ---------- 条件格式 ----------
     def _compare_conditional_formatting(self, old_ws, new_ws, result_ws):
         old_cfs = list(old_ws.conditional_formatting)
         new_cfs = list(new_ws.conditional_formatting)
@@ -411,8 +387,8 @@ class ExcelDiffEngine:
         new_set = {serialize(c) for c in new_cfs}
 
         if old_set == new_set:
-            # 完全相同：清除条件格式
-            result_ws.conditional_formatting = ConditionalFormattingList()
+            # 完全相同：清空条件格式（使用内置 clear 方法）
+            result_ws.conditional_formatting.clear()
             return False
         else:
             for cf in new_cfs:
@@ -431,7 +407,6 @@ class ExcelDiffEngine:
                         pass
             return True
 
-    # ---------- 注释工具 ----------
     def _add_comment(self, cell, text):
         if cell.comment:
             cell.comment.text += "\n" + text
@@ -446,7 +421,6 @@ class ExcelDiffEngine:
             comment.height = max(120, lines * 18)
             cell.comment = comment
 
-    # ---------- 汇总报告 ----------
     def _add_summary(self, result_wb):
         if "差异汇总" in result_wb.sheetnames:
             del result_wb["差异汇总"]
@@ -508,18 +482,14 @@ class ExcelDiffApp:
         self.root.title("Excel 差异对比工具")
         self.root.geometry("700x450")
 
-        # 全局字体设置
         default_font = ("微软雅黑", 10)
         self.root.option_add("*Font", default_font)
 
-        # 主框架：左侧按钮，右侧文件选择
         main_frame = ttk.Frame(root, padding=10)
         main_frame.pack(fill='both', expand=True)
 
-        # 左侧大按钮
         left_frame = ttk.Frame(main_frame)
         left_frame.grid(row=0, column=0, sticky='ns', padx=(0, 10))
-        # 为了让按钮垂直居中，添加弹性空间
         left_frame.grid_rowconfigure(0, weight=1)
         left_frame.grid_rowconfigure(1, weight=1)
 
@@ -534,32 +504,25 @@ class ExcelDiffApp:
         )
         self.compare_btn.grid(row=1, column=0, sticky='n')
 
-        # 右侧文件选择区
         right_frame = ttk.Frame(main_frame)
         right_frame.grid(row=0, column=1, sticky='nsew')
         right_frame.columnconfigure(1, weight=1)
 
-        # 旧版文件行
         ttk.Label(right_frame, text="旧版文件:", font=("微软雅黑", 10)).grid(row=0, column=0, sticky='w', pady=5)
         self.old_path = tk.StringVar()
         old_entry = ttk.Entry(right_frame, textvariable=self.old_path, font=("微软雅黑", 10))
         old_entry.grid(row=0, column=1, padx=5, sticky='ew')
-        old_btn = ttk.Button(right_frame, text="浏览", command=lambda: self.browse(self.old_path))
-        old_btn.grid(row=0, column=2)
+        ttk.Button(right_frame, text="浏览", command=lambda: self.browse(self.old_path)).grid(row=0, column=2)
 
-        # 新版文件行
         ttk.Label(right_frame, text="新版文件:", font=("微软雅黑", 10)).grid(row=1, column=0, sticky='w', pady=5)
         self.new_path = tk.StringVar()
         new_entry = ttk.Entry(right_frame, textvariable=self.new_path, font=("微软雅黑", 10))
         new_entry.grid(row=1, column=1, padx=5, sticky='ew')
-        new_btn = ttk.Button(right_frame, text="浏览", command=lambda: self.browse(self.new_path))
-        new_btn.grid(row=1, column=2)
+        ttk.Button(right_frame, text="浏览", command=lambda: self.browse(self.new_path)).grid(row=1, column=2)
 
-        # 进度条
         self.progress = ttk.Progressbar(root, mode='determinate')
         self.progress.pack(fill='x', padx=10, pady=(5, 0))
 
-        # 日志区域
         self.log_area = scrolledtext.ScrolledText(root, height=12, font=("微软雅黑", 10))
         self.log_area.pack(fill='both', expand=True, padx=10, pady=10)
 
