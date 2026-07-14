@@ -1,9 +1,7 @@
 """
-Excel 差异对比工具（最终修复版）
-- 修复条件格式 MultiCellRange 无 split 方法的错误
-- 左侧对比按钮高度与右侧文件选择区对齐
-- 路径输入框加长
-- 浏览按钮颜色区分（旧版绿色、新版蓝色）
+Excel 差异对比工具（修复版）
+- 修复 ConditionalFormattingList 无 clear 方法的问题
+- 优化界面布局
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -383,23 +381,19 @@ class ExcelDiffEngine:
             rules = []
             for r in cf.rules:
                 rules.append((r.type, r.priority, str(r.dxf), str(r.formula)))
-            # 将范围对象转换为字符串
             return (str(cf.sqref), tuple(rules))
 
         old_set = {serialize(c) for c in old_cfs}
         new_set = {serialize(c) for c in new_cfs}
 
         if old_set == new_set:
-            # 完全相同：清空条件格式
-            result_ws.conditional_formatting.clear()
+            # 完全相同：清空条件格式（通过赋值为新的空列表）
+            result_ws.conditional_formatting = type(result_ws.conditional_formatting)()
             return False
         else:
-            # 对每个条件格式区域添加注释
             for cf in new_cfs:
-                # 正确处理 MultiCellRange 对象，获取所有单个范围字符串
                 ranges_obj = cf.sqref
                 if isinstance(ranges_obj, MultiCellRange):
-                    # 获取所有范围
                     range_strs = [str(r) for r in ranges_obj.ranges]
                 else:
                     range_strs = str(ranges_obj).split()
@@ -495,11 +489,9 @@ class ExcelDiffApp:
         default_font = ("微软雅黑", 10)
         self.root.option_add("*Font", default_font)
 
-        # 主容器
         main_frame = ttk.Frame(root, padding=10)
         main_frame.pack(fill='both', expand=True)
 
-        # 左侧对比按钮（跨两行，高度与右侧文件选择区对齐）
         left_frame = ttk.Frame(main_frame)
         left_frame.grid(row=0, column=0, sticky='ns', padx=(0, 10))
 
@@ -514,12 +506,10 @@ class ExcelDiffApp:
         )
         self.compare_btn.pack(expand=True, fill='both')
 
-        # 右侧文件选择区
         right_frame = ttk.Frame(main_frame)
         right_frame.grid(row=0, column=1, sticky='nsew')
         right_frame.columnconfigure(1, weight=1)
 
-        # 旧版文件行
         ttk.Label(right_frame, text="旧版文件:", font=("微软雅黑", 10)).grid(row=0, column=0, sticky='w', pady=5)
         self.old_path = tk.StringVar()
         old_entry = ttk.Entry(right_frame, textvariable=self.old_path, font=("微软雅黑", 10), width=55)
@@ -528,7 +518,6 @@ class ExcelDiffApp:
                             command=lambda: self.browse(self.old_path))
         old_btn.grid(row=0, column=2, padx=2)
 
-        # 新版文件行
         ttk.Label(right_frame, text="新版文件:", font=("微软雅黑", 10)).grid(row=1, column=0, sticky='w', pady=5)
         self.new_path = tk.StringVar()
         new_entry = ttk.Entry(right_frame, textvariable=self.new_path, font=("微软雅黑", 10), width=55)
@@ -537,11 +526,9 @@ class ExcelDiffApp:
                             command=lambda: self.browse(self.new_path))
         new_btn.grid(row=1, column=2, padx=2)
 
-        # 进度条
         self.progress = ttk.Progressbar(root, mode='determinate')
         self.progress.pack(fill='x', padx=10, pady=(5, 0))
 
-        # 日志区域
         self.log_area = scrolledtext.ScrolledText(root, height=12, font=("微软雅黑", 10))
         self.log_area.pack(fill='both', expand=True, padx=10, pady=10)
 
