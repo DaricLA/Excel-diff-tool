@@ -1,157 +1,386 @@
 """
-Excel差异对比工具 - 内部使用版
+Excel 差异对比工具（完整版）
+对比两个 Excel 所有内容、格式、公式、合并单元格等，基于新文件保留差异并添加注释。
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
 import os
 from datetime import datetime
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font
-from openpyxl.comments import Comment
+from copy import copy
 
-class ExcelDiffTool:
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Border, Alignment, Side
+from openpyxl.comments import Comment
+from openpyxl.utils import get_column_letter
+
+# ---------------------------- 核心对比引擎 ----------------------------
+class ExcelDiffEngine:
+    def __init__(self, old_path, new_path, log_func=None, progress_func=None):
+        self.old_path = old_path
+        self.new_path = new_path
+        self.log = log_func or print
+        self.progress = progress_func or (lambda v, s: None)
+        self.stats = {
+            'total_cells': 0,
+            'diff_cells': 0,
+            'added_sheets': [],
+            'removed_sheets': [],
+            'renamed_sheets': {}
+        }
+
+    def compare_and_save(self, output_path):
+        """执行全部对比并保存结果"""
+        self.progress(5, "加载文件中...")
+        self.log("正在加载工作簿...")
+        old_wb = load_workbook(self.old_path)
+        new_wb = load_workbook(self.new_path)
+        # 结果基于新文件
+        result_wb = load_workbook(self.new_path)
+
+        # 1. Sheet 层面差异
+        self._compare_sheets(old_wb, new_wb, result_wb)
+
+        # 2. 处理共有Sheet
+        common = set(old_wb.sheetnames) & set(new_wb.sheetnames)
+        total = len(common)
+        for idx, sheet_name in enumerate(common, 1):
+            self.progress(10 + int(80 * idx / total), f"对比 {sheet_name} ...")
+            self.log(f"正在对比Sheet: {sheet_name} ({idx}/{total})")
+            old_ws = old_wb[sheet_name]
+            new_ws = new_wb[sheet_name]
+            result_ws = result_wb[sheet_name]
+            self._compare_worksheet(old_ws, new_ws, result_ws)
+
+        # 3. 生成汇总报告
+        self.progress(95, "生成汇总...")
+        self._add_summary(result_wb)
+
+        # 4. 保存
+        self.progress(98, "保存文件...")
+        result_wb.save(output_path)
+        self.progress(100, "完成")
+        self.log(f"对比完成，结果已保存至: {output_path}")
+        self.log(f"统计：共 {self.stats['total_cells']} 单元格，{self.stats['diff_cells']} 处差异")
+
+    def _compare_sheets(self, old_wb, new_wb, result_wb):
+        old_set = set(old_wb.sheetnames)
+        new_set = set(new_wb.sheetnames)
+
+        self.stats['added_sheets'] = sorted(new_set - old_set)
+        self.stats['removed_sheets'] = sorted(old_set - new_set)
+
+        # 检测重命名（简单策略：数量相同的增减可能为改名，需人工确认）
+        # 这里只记录，不自动匹配
+        if self.stats['added_sheets']:
+            self.log(f"新增Sheet: {', '.join(self.stats['added_sheets'])}")
+        if self.stats['removed_sheets']:
+            self.log(f"删除Sheet: {', '.join(self.stats['removed_sheets'])}")
+
+        # 为新Sheet添加说明注释
+        for name in self.stats['added_sheets']:
+            if name in result_wb.sheetnames:
+                ws = result_wb[name]
+                if ws.max_row >= 1 and ws.max_column >= 1:
+                    cell = ws.cell(1, 1)
+                    if cell.comment:
+                        cell.comment.text += "\n[新增Sheet]"
+                    else:
+                        cell.comment = Comment("[新增Sheet，旧版中不存在]", "ExcelDiff")
+
+        # 为删除的Sheet在汇总中说明（见汇总生成）
+
+    def _compare_worksheet(self, old_ws, new_ws, result_ws):
+        """对比单个工作表的所有差异，并清空完全相同的单元格"""
+        max_row = max(old_ws.max_row, new_ws.max_row)
+        max_col = max(old_ws.max_column, new_ws.max_column)
+        self.stats['total_cells'] += max_row * max_col
+
+        diff_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+        for row in range(1, max_row + 1):
+            for col in range(1, max_col + 1):
+                old_cell = old_ws.cell(row, col)
+                new_cell = new_ws.cell(row, col)
+                result_cell = result_ws.cell(row, col)
+
+                # 检查是否完全相同（值 + 格式 + 合并状态等）
+                if self._is_identical(old_cell, new_cell, old_ws, new_ws):
+                    # 完全相同 -> 清空结果单元格
+                    result_cell.value = None
+                    # 重置为默认样式
+                    result_cell.font = Font()
+                    result_cell.fill = PatternFill()
+                    result_cell.border = Border()
+                    result_cell.alignment = Alignment()
+                    result_cell.number_format = 'General'
+                    # 移除可能存在的注释
+                    result_cell.comment = None
+                else:
+                    self.stats['diff_cells'] += 1
+                    # 保留新单元格的值和格式（已经在result中，因为是copy过来的）
+                    # 添加高亮和注释
+                    result_cell.fill = diff_fill
+                    diff_desc = self._describe_diffs(old_cell, new_cell, old_ws, new_ws)
+                    comment = Comment(diff_desc, "ExcelDiff")
+                    result_cell.comment = comment
+
+        # 合并单元格差异
+        self._compare_merged_cells(old_ws, new_ws, result_ws)
+
+    def _is_identical(self, old_cell, new_cell, old_ws, new_ws):
+        """判断单元格（内容+格式+合并状态）是否完全一致"""
+        # 值对比（包含公式）
+        if old_cell.value != new_cell.value:
+            return False
+
+        # 格式对比
+        if not self._font_equal(old_cell.font, new_cell.font):
+            return False
+        if not self._fill_equal(old_cell.fill, new_cell.fill):
+            return False
+        if not self._border_equal(old_cell.border, new_cell.border):
+            return False
+        if not self._alignment_equal(old_cell.alignment, new_cell.alignment):
+            return False
+        if old_cell.number_format != new_cell.number_format:
+            return False
+
+        # 检查合并状态（单元格是否在合并范围内）
+        old_merged = self._cell_is_merged(old_ws, old_cell.row, old_cell.column)
+        new_merged = self._cell_is_merged(new_ws, new_cell.row, new_cell.column)
+        if old_merged != new_merged:
+            return False
+
+        return True
+
+    def _describe_diffs(self, old_cell, new_cell, old_ws, new_ws):
+        """生成差异说明文本"""
+        diffs = []
+        # 值差异
+        if old_cell.value != new_cell.value:
+            old_val = old_cell.value if old_cell.value is not None else "(空)"
+            new_val = new_cell.value if new_cell.value is not None else "(空)"
+            # 判断是否为公式
+            old_is_formula = isinstance(old_cell.value, str) and old_cell.value.startswith('=')
+            new_is_formula = isinstance(new_cell.value, str) and new_cell.value.startswith('=')
+            if old_is_formula or new_is_formula:
+                diffs.append(f"公式: {old_val} → {new_val}")
+            else:
+                diffs.append(f"值: {old_val} → {new_val}")
+
+        # 字体
+        if not self._font_equal(old_cell.font, new_cell.font):
+            f_diffs = []
+            if old_cell.font.name != new_cell.font.name:
+                f_diffs.append(f"字体: {old_cell.font.name}→{new_cell.font.name}")
+            if old_cell.font.size != new_cell.font.size:
+                f_diffs.append(f"大小: {old_cell.font.size}→{new_cell.font.size}")
+            if old_cell.font.bold != new_cell.font.bold:
+                f_diffs.append(f"粗体: {old_cell.font.bold}→{new_cell.font.bold}")
+            if old_cell.font.italic != new_cell.font.italic:
+                f_diffs.append(f"斜体: {old_cell.font.italic}→{new_cell.font.italic}")
+            if old_cell.font.color != new_cell.font.color:
+                f_diffs.append("颜色变更")
+            if f_diffs:
+                diffs.append("字体: " + "; ".join(f_diffs))
+
+        # 填充
+        if not self._fill_equal(old_cell.fill, new_cell.fill):
+            diffs.append("填充色变更")
+
+        # 边框
+        if not self._border_equal(old_cell.border, new_cell.border):
+            diffs.append("边框变更")
+
+        # 对齐
+        if not self._alignment_equal(old_cell.alignment, new_cell.alignment):
+            diffs.append("对齐方式变更")
+
+        # 数字格式
+        if old_cell.number_format != new_cell.number_format:
+            diffs.append(f"数字格式: {old_cell.number_format}→{new_cell.number_format}")
+
+        # 合并状态
+        old_merged = self._cell_is_merged(old_ws, old_cell.row, old_cell.column)
+        new_merged = self._cell_is_merged(new_ws, new_cell.row, new_cell.column)
+        if old_merged != new_merged:
+            diffs.append("合并单元格状态变更")
+
+        if not diffs:
+            diffs.append("未知差异")
+        return "【与旧版差异】\n" + "\n".join(diffs)
+
+    def _compare_merged_cells(self, old_ws, new_ws, result_ws):
+        """处理合并单元格变更"""
+        old_merged = set(old_ws.merged_cells.ranges)
+        new_merged = set(new_ws.merged_cells.ranges)
+        # 新增的合并区域
+        for rng in new_merged - old_merged:
+            for row in range(rng.min_row, rng.max_row + 1):
+                for col in range(rng.min_col, rng.max_col + 1):
+                    cell = result_ws.cell(row, col)
+                    cell.fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
+                    if cell.comment:
+                        cell.comment.text += "\n[新增合并区域]"
+                    else:
+                        cell.comment = Comment("[新增合并区域]", "ExcelDiff")
+        # 删除的合并区域（新文件中已无，无法直接标记，可在汇总中说明）
+
+    # -------------------- 格式比较辅助方法 --------------------
+    @staticmethod
+    def _font_equal(f1, f2):
+        return (f1.name == f2.name and f1.size == f2.size and f1.bold == f2.bold and
+                f1.italic == f2.italic and f1.underline == f2.underline and f1.color == f2.color)
+
+    @staticmethod
+    def _fill_equal(f1, f2):
+        return (f1.fill_type == f2.fill_type and f1.start_color == f2.start_color and
+                f1.end_color == f2.end_color)
+
+    @staticmethod
+    def _border_equal(b1, b2):
+        for side in ['left', 'right', 'top', 'bottom']:
+            s1 = getattr(b1, side)
+            s2 = getattr(b2, side)
+            if s1.style != s2.style or s1.color != s2.color:
+                return False
+        return True
+
+    @staticmethod
+    def _alignment_equal(a1, a2):
+        return (a1.horizontal == a2.horizontal and a1.vertical == a2.vertical and
+                a1.wrap_text == a2.wrap_text)
+
+    @staticmethod
+    def _cell_is_merged(ws, row, col):
+        """检查指定单元格是否属于某个合并范围"""
+        for merged_range in ws.merged_cells.ranges:
+            if (merged_range.min_row <= row <= merged_range.max_row and
+                merged_range.min_col <= col <= merged_range.max_col):
+                return True
+        return False
+
+    def _add_summary(self, result_wb):
+        """在结果文件最前面插入汇总Sheet"""
+        if "差异汇总" in result_wb.sheetnames:
+            del result_wb["差异汇总"]
+        ws = result_wb.create_sheet("差异汇总", 0)
+        ws['A1'] = "Excel差异对比汇总"
+        ws['A1'].font = Font(size=16, bold=True)
+        ws.merge_cells('A1:C1')
+
+        ws['A3'] = "对比时间:"
+        ws['B3'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws['A4'] = "旧版文件:"
+        ws['B4'] = os.path.basename(self.old_path)
+        ws['A5'] = "新版文件:"
+        ws['B5'] = os.path.basename(self.new_path)
+
+        ws['A7'] = "统计项"
+        ws['B7'] = "数量"
+        ws['A7'].font = Font(bold=True)
+        ws['B7'].font = Font(bold=True)
+
+        stats_rows = [
+            ("检查单元格总数", self.stats['total_cells']),
+            ("差异单元格数", self.stats['diff_cells']),
+            ("新增Sheet", len(self.stats['added_sheets'])),
+            ("删除Sheet", len(self.stats['removed_sheets'])),
+        ]
+        for i, (label, val) in enumerate(stats_rows, 8):
+            ws.cell(row=i, column=1, value=label)
+            ws.cell(row=i, column=2, value=val)
+
+        if self.stats['added_sheets']:
+            ws['A14'] = "新增Sheet列表:"
+            ws['A14'].font = Font(color="006600", bold=True)
+            for j, name in enumerate(self.stats['added_sheets'], 15):
+                ws.cell(row=j, column=1, value=name).font = Font(color="006600")
+
+        if self.stats['removed_sheets']:
+            next_row = 15 + len(self.stats['added_sheets'])
+            ws.cell(row=next_row, column=1, value="删除Sheet列表:").font = Font(color="CC0000", bold=True)
+            for j, name in enumerate(self.stats['removed_sheets'], next_row + 1):
+                ws.cell(row=j, column=1, value=name).font = Font(color="CC0000")
+
+        ws.column_dimensions['A'].width = 25
+        ws.column_dimensions['B'].width = 30
+
+
+# ---------------------------- GUI ----------------------------
+class ExcelDiffApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Excel差异对比工具")
-        self.root.geometry("600x500")
-        
+        self.root.title("Excel 差异对比工具")
+        self.root.geometry("650x500")
+
         # 文件选择
-        ttk.Label(root, text="旧版文件:").pack(pady=5)
-        self.old_file = ttk.Entry(root, width=70)
-        self.old_file.pack()
-        ttk.Button(root, text="浏览", command=lambda: self.browse(self.old_file)).pack(pady=2)
-        
-        ttk.Label(root, text="新版文件:").pack(pady=5)
-        self.new_file = ttk.Entry(root, width=70)
-        self.new_file.pack()
-        ttk.Button(root, text="浏览", command=lambda: self.browse(self.new_file)).pack(pady=2)
-        
-        # 对比按钮
-        self.btn = ttk.Button(root, text="开始对比", command=self.start)
-        self.btn.pack(pady=10)
-        
+        frame = ttk.Frame(root, padding=10)
+        frame.pack(fill='x')
+
+        ttk.Label(frame, text="旧版文件:").grid(row=0, column=0, sticky='w')
+        self.old_path = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.old_path, width=55).grid(row=0, column=1, padx=5)
+        ttk.Button(frame, text="浏览", command=lambda: self.browse(self.old_path)).grid(row=0, column=2)
+
+        ttk.Label(frame, text="新版文件:").grid(row=1, column=0, sticky='w', pady=5)
+        self.new_path = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.new_path, width=55).grid(row=1, column=1, padx=5)
+        ttk.Button(frame, text="浏览", command=lambda: self.browse(self.new_path)).grid(row=1, column=2)
+
+        ttk.Button(frame, text="开始对比", command=self.start).grid(row=2, column=1, pady=10)
+
         # 进度条
-        self.progress = ttk.Progressbar(root, mode='indeterminate')
-        self.progress.pack(fill='x', padx=20)
-        
+        self.progress = ttk.Progressbar(root, mode='determinate')
+        self.progress.pack(fill='x', padx=10)
+
         # 日志
-        self.log = scrolledtext.ScrolledText(root, height=15)
-        self.log.pack(fill='both', expand=True, padx=10, pady=10)
-        
-    def browse(self, entry):
-        f = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
-        if f:
-            entry.delete(0, 'end')
-            entry.insert(0, f)
-    
-    def print(self, msg):
-        self.log.insert('end', f"[{datetime.now():%H:%M:%S}] {msg}\n")
-        self.log.see('end')
-        self.root.update()
-    
+        self.log_area = scrolledtext.ScrolledText(root, height=15)
+        self.log_area.pack(fill='both', expand=True, padx=10, pady=10)
+
+    def browse(self, var):
+        filename = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
+        if filename:
+            var.set(filename)
+
+    def log(self, msg):
+        self.log_area.insert('end', f"[{datetime.now():%H:%M:%S}] {msg}\n")
+        self.log_area.see('end')
+        self.root.update_idletasks()
+
+    def update_progress(self, value, status=""):
+        self.progress['value'] = value
+        if status:
+            self.log(status)
+        self.root.update_idletasks()
+
     def start(self):
-        if not self.old_file.get() or not self.new_file.get():
-            messagebox.showerror("错误", "请选择文件")
+        old = self.old_path.get()
+        new = self.new_path.get()
+        if not old or not new:
+            messagebox.showerror("错误", "请选择两个Excel文件")
             return
-        
-        out = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
-        if not out:
+
+        output = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
+        if not output:
             return
-        
-        self.btn['state'] = 'disabled'
-        self.progress.start()
-        threading.Thread(target=self.run, args=(out,), daemon=True).start()
-    
-    def run(self, out):
+
+        # 在新线程中运行对比
+        threading.Thread(target=self.run, args=(old, new, output), daemon=True).start()
+
+    def run(self, old, new, output):
         try:
-            self.print("加载文件中...")
-            old_wb = load_workbook(self.old_file.get())
-            new_wb = load_workbook(self.new_file.get())
-            result_wb = load_workbook(self.new_file.get())
-            
-            yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-            
-            # 对比Sheet
-            old_sheets = set(old_wb.sheetnames)
-            new_sheets = set(new_wb.sheetnames)
-            
-            added = new_sheets - old_sheets
-            removed = old_sheets - new_sheets
-            
-            if added:
-                self.print(f"新增Sheet: {', '.join(added)}")
-            if removed:
-                self.print(f"删除Sheet: {', '.join(removed)}")
-            
-            # 创建汇总Sheet
-            if "差异汇总" not in result_wb.sheetnames:
-                summary = result_wb.create_sheet("差异汇总", 0)
-            else:
-                summary = result_wb["差异汇总"]
-                summary.delete_rows(1, summary.max_row)
-            
-            summary['A1'] = "Excel差异对比汇总"
-            summary['A1'].font = Font(size=14, bold=True)
-            summary['A3'] = f"对比时间: {datetime.now():%Y-%m-%d %H:%M:%S}"
-            summary['A4'] = f"旧版: {os.path.basename(self.old_file.get())}"
-            summary['A5'] = f"新版: {os.path.basename(self.new_file.get())}"
-            
-            row_num = 7
-            total_diffs = 0
-            
-            # 对比共有Sheet
-            for sheet_name in old_sheets & new_sheets:
-                self.print(f"对比: {sheet_name}")
-                old_ws = old_wb[sheet_name]
-                new_ws = new_wb[sheet_name]
-                result_ws = result_wb[sheet_name]
-                
-                diffs = 0
-                max_row = max(old_ws.max_row, new_ws.max_row)
-                max_col = max(old_ws.max_column, new_ws.max_column)
-                
-                for r in range(1, max_row + 1):
-                    for c in range(1, max_col + 1):
-                        old_cell = old_ws.cell(r, c)
-                        new_cell = new_ws.cell(r, c)
-                        result_cell = result_ws.cell(r, c)
-                        
-                        # 快速检查是否相同
-                        if old_cell.value == new_cell.value:
-                            continue
-                        
-                        # 有差异
-                        diffs += 1
-                        result_cell.fill = yellow
-                        old_val = str(old_cell.value) if old_cell.value else "(空)"
-                        new_val = str(new_cell.value) if new_cell.value else "(空)"
-                        result_cell.comment = Comment(
-                            f"旧版: {old_val}\n新版: {new_val}", 
-                            "ExcelDiff"
-                        )
-                
-                if diffs > 0:
-                    self.print(f"  {sheet_name}: {diffs}个差异")
-                    summary[f'A{row_num}'] = f"{sheet_name}: {diffs}个差异单元格"
-                    row_num += 1
-                    total_diffs += diffs
-            
-            summary[f'A{row_num+1}'] = f"总计: {total_diffs}个差异"
-            summary[f'A{row_num+1}'].font = Font(bold=True)
-            
-            result_wb.save(out)
-            self.print(f"完成! 共{total_diffs}个差异, 已保存至: {out}")
-            messagebox.showinfo("完成", f"对比完成!\n共{total_diffs}个差异")
-            
+            engine = ExcelDiffEngine(old, new, log_func=self.log, progress_func=self.update_progress)
+            engine.compare_and_save(output)
+            messagebox.showinfo("完成", f"对比完成！\n差异单元格: {engine.stats['diff_cells']}\n结果保存至:\n{output}")
         except Exception as e:
-            self.print(f"错误: {e}")
-            messagebox.showerror("错误", str(e))
+            self.log(f"错误: {e}")
+            messagebox.showerror("失败", str(e))
         finally:
-            self.btn['state'] = 'normal'
-            self.progress.stop()
+            self.progress['value'] = 0
 
 if __name__ == "__main__":
     root = tk.Tk()
-    ExcelDiffTool(root)
+    app = ExcelDiffApp(root)
     root.mainloop()
