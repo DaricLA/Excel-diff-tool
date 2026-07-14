@@ -1,6 +1,7 @@
 """
 Excel 差异对比工具（完整版）
-对比两个 Excel 所有内容、格式、公式、合并单元格、行高列宽、条件格式等，基于新文件保留差异并添加注释。
+支持：富文本（同一单元格内部分字符格式不同）、默认显示注释、行高列宽、条件格式、
+      增减sheet注释标记、汇总统计颜色标注等。
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -12,8 +13,9 @@ from copy import copy
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Border, Alignment, Side
 from openpyxl.comments import Comment
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.cell.cell import MergedCell
+from openpyxl.cell.rich_text import CellRichText, TextBlock
 
 # ---------------------------- 核心对比引擎 ----------------------------
 class ExcelDiffEngine:
@@ -27,64 +29,76 @@ class ExcelDiffEngine:
             'diff_cells': 0,
             'added_sheets': [],
             'removed_sheets': [],
-            'renamed_sheets': {}
+            'cond_format_diffs': []   # 记录有条件格式差异的sheet
         }
 
     def compare_and_save(self, output_path):
-        """执行全部对比并保存结果"""
         self.progress(5, "加载文件中...")
         self.log("正在加载工作簿...")
         old_wb = load_workbook(self.old_path)
         new_wb = load_workbook(self.new_path)
         result_wb = load_workbook(self.new_path)
 
-        # 1. Sheet 层面差异
+        # 1. Sheet 差异
         self._compare_sheets(old_wb, new_wb, result_wb)
 
-        # 2. 处理共有Sheet
+        # 2. 共有 Sheet 详细对比
         common = set(old_wb.sheetnames) & set(new_wb.sheetnames)
         total = len(common)
         for idx, sheet_name in enumerate(common, 1):
             self.progress(10 + int(80 * idx / total), f"对比 {sheet_name} ...")
-            self.log(f"正在对比Sheet: {sheet_name} ({idx}/{total})")
+            self.log(f"正在对比 Sheet: {sheet_name} ({idx}/{total})")
             old_ws = old_wb[sheet_name]
             new_ws = new_wb[sheet_name]
             result_ws = result_wb[sheet_name]
             self._compare_worksheet(old_ws, new_ws, result_ws)
-            # 行高列宽对比
             self._compare_row_col_dimensions(old_ws, new_ws, result_ws)
-            # 条件格式对比
-            self._compare_conditional_formatting(old_ws, new_ws, result_ws)
+            self._compare_conditional_formatting(old_ws, new_ws, result_ws, sheet_name)
 
-        # 3. 生成汇总报告
+        # 3. 汇总报告
         self.progress(95, "生成汇总...")
         self._add_summary(result_wb)
 
-        # 4. 保存
         self.progress(98, "保存文件...")
         result_wb.save(output_path)
         self.progress(100, "完成")
-        self.log(f"对比完成，结果已保存至: {output_path}")
-        self.log(f"统计：共 {self.stats['total_cells']} 单元格，{self.stats['diff_cells']} 处差异")
+        self.log(f"对比完成，结果保存至: {output_path}")
+        self.log(f"统计：共检查 {self.stats['total_cells']} 单元格，发现 {self.stats['diff_cells']} 处差异")
 
+    # ---------- Sheet 差异 ----------
     def _compare_sheets(self, old_wb, new_wb, result_wb):
         old_set = set(old_wb.sheetnames)
         new_set = set(new_wb.sheetnames)
         self.stats['added_sheets'] = sorted(new_set - old_set)
         self.stats['removed_sheets'] = sorted(old_set - new_set)
-        if self.stats['added_sheets']:
-            self.log(f"新增Sheet: {', '.join(self.stats['added_sheets'])}")
-        if self.stats['removed_sheets']:
-            self.log(f"删除Sheet: {', '.join(self.stats['removed_sheets'])}")
+
+        # 为新增 sheet 在第一个单元格添加注释
         for name in self.stats['added_sheets']:
             if name in result_wb.sheetnames:
                 ws = result_wb[name]
                 if ws.max_row >= 1 and ws.max_column >= 1:
                     cell = ws.cell(1, 1)
-                    self._append_comment(cell, "[新增Sheet，旧版中不存在]")
+                    self._add_comment(cell, "【新增 Sheet，旧版中不存在】")
 
+        # 为删除的 sheet 在汇总中标记（汇总生成时处理），同时也插入占位 sheet 便于查看
+        if self.stats['removed_sheets']:
+            # 如果已存在占位 sheet 则删除重建
+            placeholder_name = "已删除的Sheet"
+            if placeholder_name in result_wb.sheetnames:
+                del result_wb[placeholder_name]
+            ws = result_wb.create_sheet(placeholder_name)
+            ws['A1'] = "以下 Sheet 在新版中被删除："
+            ws['A1'].font = Font(bold=True, color="FF0000")
+            for i, name in enumerate(self.stats['removed_sheets'], 2):
+                cell = ws.cell(row=i, column=1)
+                cell.value = name
+                cell.font = Font(color="FF0000")
+                self._add_comment(cell, f"【旧版中存在，新版已删除】")
+
+            self.log(f"删除 Sheet: {', '.join(self.stats['removed_sheets'])}")
+
+    # ---------- 工作表单元格对比 ----------
     def _compare_worksheet(self, old_ws, new_ws, result_ws):
-        """对比单个工作表的所有差异，并清空完全相同的单元格"""
         max_row = max(old_ws.max_row, new_ws.max_row)
         max_col = max(old_ws.max_column, new_ws.max_column)
         self.stats['total_cells'] += max_row * max_col
@@ -97,13 +111,12 @@ class ExcelDiffEngine:
                 new_cell = new_ws.cell(row, col)
                 result_cell = result_ws.cell(row, col)
 
-                # 跳过合并单元格中的非左上角单元格
                 if isinstance(result_cell, MergedCell):
                     continue
 
-                # 检查是否完全相同
+                # 检查是否完全相同（含富文本格式）
                 if self._is_identical(old_cell, new_cell, old_ws, new_ws):
-                    # 完全相同 -> 清空结果单元格，恢复默认样式
+                    # 完全相同则清空
                     result_cell.value = None
                     result_cell.font = Font()
                     result_cell.fill = PatternFill()
@@ -113,17 +126,17 @@ class ExcelDiffEngine:
                     result_cell.comment = None
                 else:
                     self.stats['diff_cells'] += 1
-                    # 保留新单元格的值和格式，高亮并添加差异注释
                     result_cell.fill = diff_fill
                     diff_desc = self._describe_diffs(old_cell, new_cell, old_ws, new_ws)
-                    self._append_comment(result_cell, diff_desc)
+                    self._add_comment(result_cell, diff_desc)
 
-        # 合并单元格差异
         self._compare_merged_cells(old_ws, new_ws, result_ws)
 
     def _is_identical(self, old_cell, new_cell, old_ws, new_ws):
-        if old_cell.value != new_cell.value:
+        # 比较值（需处理富文本）
+        if not self._value_equal(old_cell.value, new_cell.value):
             return False
+        # 比较单元格级别格式
         if not self._font_equal(old_cell.font, new_cell.font):
             return False
         if not self._fill_equal(old_cell.fill, new_cell.fill):
@@ -134,29 +147,34 @@ class ExcelDiffEngine:
             return False
         if old_cell.number_format != new_cell.number_format:
             return False
+        # 合并状态
         if self._cell_is_merged(old_ws, old_cell.row, old_cell.column) != \
            self._cell_is_merged(new_ws, new_cell.row, new_cell.column):
             return False
         return True
 
     def _describe_diffs(self, old_cell, new_cell, old_ws, new_ws):
-        """生成详细的差异说明，支持多差异同时显示"""
         diffs = []
-        # 值差异（包括公式）
-        if old_cell.value != new_cell.value:
-            old_val = old_cell.value if old_cell.value is not None else "(空)"
-            new_val = new_cell.value if new_cell.value is not None else "(空)"
-            if (isinstance(old_cell.value, str) and old_cell.value.startswith('=')) or \
-               (isinstance(new_cell.value, str) and new_cell.value.startswith('=')):
+        # 值差异（含富文本）
+        if not self._value_equal(old_cell.value, new_cell.value):
+            old_val = self._format_value(old_cell.value)
+            new_val = self._format_value(new_cell.value)
+            # 区分富文本和普通值
+            old_is_rich = isinstance(old_cell.value, CellRichText)
+            new_is_rich = isinstance(new_cell.value, CellRichText)
+            if old_is_rich or new_is_rich:
+                diffs.append(f"内容(含局部格式): {old_val} → {new_val}")
+            elif (isinstance(old_cell.value, str) and old_cell.value.startswith('=')) or \
+                 (isinstance(new_cell.value, str) and new_cell.value.startswith('=')):
                 diffs.append(f"公式: {old_val} → {new_val}")
             else:
                 diffs.append(f"值: {old_val} → {new_val}")
 
-        # 字体
+        # 字体差异
         if not self._font_equal(old_cell.font, new_cell.font):
             f_diffs = []
             if old_cell.font.name != new_cell.font.name:
-                f_diffs.append(f"字体名称: {old_cell.font.name}→{new_cell.font.name}")
+                f_diffs.append(f"字体: {old_cell.font.name}→{new_cell.font.name}")
             if old_cell.font.size != new_cell.font.size:
                 f_diffs.append(f"大小: {old_cell.font.size}→{new_cell.font.size}")
             if old_cell.font.bold != new_cell.font.bold:
@@ -178,7 +196,7 @@ class ExcelDiffEngine:
         if not self._border_equal(old_cell.border, new_cell.border):
             diffs.append("边框样式变更")
 
-        # 对齐方式
+        # 对齐
         if not self._alignment_equal(old_cell.alignment, new_cell.alignment):
             a_diffs = []
             if old_cell.alignment.horizontal != new_cell.alignment.horizontal:
@@ -204,69 +222,117 @@ class ExcelDiffEngine:
             diffs.append("未知差异")
         return "【与旧版差异】\n" + "\n".join(diffs)
 
+    # ---------- 富文本处理 ----------
+    @staticmethod
+    def _value_equal(val1, val2):
+        """判断两个单元格值是否相同（考虑富文本）"""
+        if type(val1) != type(val2):
+            return False
+        if isinstance(val1, CellRichText) and isinstance(val2, CellRichText):
+            # 比较富文本：长度、每段文本和格式
+            if len(val1) != len(val2):
+                return False
+            for t1, t2 in zip(val1, val2):
+                if t1.text != t2.text:
+                    return False
+                if not ExcelDiffEngine._font_equal(t1.font, t2.font):
+                    return False
+            return True
+        else:
+            return val1 == val2
+
+    @staticmethod
+    def _format_value(val):
+        """将值转换为适合显示的字符串"""
+        if val is None:
+            return "(空)"
+        if isinstance(val, CellRichText):
+            return str(val)  # 纯文本显示
+        return str(val)
+
+    # ---------- 合并单元格 ----------
     def _compare_merged_cells(self, old_ws, new_ws, result_ws):
         old_merged = set(old_ws.merged_cells.ranges)
         new_merged = set(new_ws.merged_cells.ranges)
         for rng in new_merged - old_merged:
             cell = result_ws.cell(rng.min_row, rng.min_col)
             cell.fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
-            self._append_comment(cell, "[新增合并区域]")
+            self._add_comment(cell, "【新增合并区域】")
 
+    # ---------- 行高列宽 ----------
     def _compare_row_col_dimensions(self, old_ws, new_ws, result_ws):
-        """对比行高和列宽，在有变化的行/列首单元格添加注释"""
-        # 行高对比
+        # 行高
         for row_idx in old_ws.row_dimensions:
             old_height = old_ws.row_dimensions[row_idx].height
             new_height = new_ws.row_dimensions[row_idx].height if row_idx in new_ws.row_dimensions else None
             if old_height != new_height:
-                # 在A列对应行添加注释
                 cell = result_ws.cell(row=row_idx, column=1)
-                msg = f"行高变化: {old_height} → {new_height}"
-                self._append_comment(cell, msg)
+                self._add_comment(cell, f"行高变化: {old_height} → {new_height}")
         for row_idx in new_ws.row_dimensions:
             if row_idx not in old_ws.row_dimensions:
                 new_height = new_ws.row_dimensions[row_idx].height
                 if new_height is not None:
                     cell = result_ws.cell(row=row_idx, column=1)
-                    msg = f"行高新设置: {new_height}"
-                    self._append_comment(cell, msg)
+                    self._add_comment(cell, f"行高新设置: {new_height}")
 
-        # 列宽对比
+        # 列宽
         for col_letter in old_ws.column_dimensions:
             old_width = old_ws.column_dimensions[col_letter].width
             new_width = new_ws.column_dimensions[col_letter].width if col_letter in new_ws.column_dimensions else None
             if old_width != new_width:
-                cell = result_ws.cell(row=1, column=col_letter_idx(col_letter))
-                msg = f"列宽变化: {old_width} → {new_width}"
-                self._append_comment(cell, msg)
+                col_idx = column_index_from_string(col_letter)
+                cell = result_ws.cell(row=1, column=col_idx)
+                self._add_comment(cell, f"列宽变化: {old_width} → {new_width}")
         for col_letter in new_ws.column_dimensions:
             if col_letter not in old_ws.column_dimensions:
                 new_width = new_ws.column_dimensions[col_letter].width
                 if new_width is not None:
-                    cell = result_ws.cell(row=1, column=col_letter_idx(col_letter))
-                    msg = f"列宽新设置: {new_width}"
-                    self._append_comment(cell, msg)
+                    col_idx = column_index_from_string(col_letter)
+                    cell = result_ws.cell(row=1, column=col_idx)
+                    self._add_comment(cell, f"列宽新设置: {new_width}")
 
-    def _compare_conditional_formatting(self, old_ws, new_ws, result_ws):
-        """对比条件格式，如果有变化则在A1单元格添加提示"""
-        # 将条件格式规则转为字符串比较（简化处理）
-        old_rules = [str(cf) for cf in old_ws.conditional_formatting]
-        new_rules = [str(cf) for cf in new_ws.conditional_formatting]
-        if old_rules != new_rules:
+    # ---------- 条件格式 ----------
+    def _compare_conditional_formatting(self, old_ws, new_ws, result_ws, sheet_name):
+        # 使用条件格式范围对象进行比较
+        old_cfs = list(old_ws.conditional_formatting)
+        new_cfs = list(new_ws.conditional_formatting)
+        # 由于条件格式对象难以直接相等比较，将其序列化为可比较的字符串
+        def serialize_cf(cf):
+            rules_str = []
+            for rule in cf.rules:
+                # 提取规则的主要属性
+                rules_str.append(f"type={rule.type},priority={rule.priority},"
+                                 f"dxf={rule.dxf},formula={rule.formula}")
+            return (str(cf.sqref), tuple(rules_str))
+
+        old_set = {serialize_cf(cf) for cf in old_cfs}
+        new_set = {serialize_cf(cf) for cf in new_cfs}
+
+        if old_set != new_set:
+            self.stats.setdefault('cond_format_diffs', []).append(sheet_name)
+            # 在 A1 单元格标记
             cell = result_ws.cell(row=1, column=1)
-            self._append_comment(cell, "条件格式有变更，请检查条件格式规则")
+            self._add_comment(cell, "【条件格式有变更，请检查条件格式规则】")
 
-    def _append_comment(self, cell, text):
-        """为单元格添加或追加注释，并设置较大的文本框尺寸"""
+    # ---------- 注释工具（默认显示、大尺寸） ----------
+    def _add_comment(self, cell, text):
+        """添加或追加注释，设置自动尺寸并默认显示"""
         if cell.comment:
+            # 追加内容
             cell.comment.text += "\n" + text
+            # 重新设置尺寸（可根据内容行数略调）
+            lines = cell.comment.text.count("\n") + 1
+            cell.comment.width = 350
+            cell.comment.height = max(150, lines * 20)
         else:
             comment = Comment(text, "ExcelDiff")
-            comment.width = 400  # 设置注释框宽度
-            comment.height = 200  # 设置注释框高度
+            comment.visible = True  # 默认显示，而不是悬停才显示
+            lines = text.count("\n") + 1
+            comment.width = 350
+            comment.height = max(150, lines * 20)
             cell.comment = comment
 
-    # -------------------- 格式比较辅助方法 --------------------
+    # ---------- 格式比较静态方法 ----------
     @staticmethod
     def _font_equal(f1, f2):
         return (f1.name == f2.name and f1.size == f2.size and f1.bold == f2.bold and
@@ -299,50 +365,73 @@ class ExcelDiffEngine:
                 return True
         return False
 
+    # ---------- 汇总报告 ----------
     def _add_summary(self, result_wb):
         if "差异汇总" in result_wb.sheetnames:
             del result_wb["差异汇总"]
         ws = result_wb.create_sheet("差异汇总", 0)
+
+        # 标题
         ws['A1'] = "Excel差异对比汇总"
         ws['A1'].font = Font(size=16, bold=True)
         ws.merge_cells('A1:C1')
+
         ws['A3'] = "对比时间:"
         ws['B3'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ws['A4'] = "旧版文件:"
         ws['B4'] = os.path.basename(self.old_path)
         ws['A5'] = "新版文件:"
         ws['B5'] = os.path.basename(self.new_path)
+
+        # 统计表头
         ws['A7'] = "统计项"
         ws['B7'] = "数量"
         ws['A7'].font = Font(bold=True)
         ws['B7'].font = Font(bold=True)
-        stats_rows = [
+
+        # 颜色规则：0 用绿色，>0 用黄色
+        green_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
+        yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+        def color_fill(val):
+            return green_fill if val == 0 else yellow_fill
+
+        stats_data = [
             ("检查单元格总数", self.stats['total_cells']),
             ("差异单元格数", self.stats['diff_cells']),
-            ("新增Sheet", len(self.stats['added_sheets'])),
-            ("删除Sheet", len(self.stats['removed_sheets'])),
+            ("新增 Sheet", len(self.stats['added_sheets'])),
+            ("删除 Sheet", len(self.stats['removed_sheets'])),
+            ("有条件格式差异的 Sheet", len(self.stats.get('cond_format_diffs', [])))
         ]
-        for i, (label, val) in enumerate(stats_rows, 8):
-            ws.cell(row=i, column=1, value=label)
-            ws.cell(row=i, column=2, value=val)
+
+        for i, (label, val) in enumerate(stats_data, 8):
+            cell_a = ws.cell(row=i, column=1)
+            cell_a.value = label
+            cell_b = ws.cell(row=i, column=2)
+            cell_b.value = val
+            cell_b.fill = color_fill(val)
+
+        # 列表信息
+        row = 15
         if self.stats['added_sheets']:
-            ws['A14'] = "新增Sheet列表:"
-            ws['A14'].font = Font(color="006600", bold=True)
-            for j, name in enumerate(self.stats['added_sheets'], 15):
-                ws.cell(row=j, column=1, value=name).font = Font(color="006600")
+            ws.cell(row=row, column=1, value="新增 Sheet 列表:").font = Font(color="006600", bold=True)
+            for name in self.stats['added_sheets']:
+                row += 1
+                c = ws.cell(row=row, column=1, value=name)
+                c.font = Font(color="006600")
+                self._add_comment(c, "【新增 Sheet】")
+
         if self.stats['removed_sheets']:
-            next_row = 15 + len(self.stats['added_sheets'])
-            ws.cell(row=next_row, column=1, value="删除Sheet列表:").font = Font(color="CC0000", bold=True)
-            for j, name in enumerate(self.stats['removed_sheets'], next_row + 1):
-                ws.cell(row=j, column=1, value=name).font = Font(color="CC0000")
-        ws.column_dimensions['A'].width = 25
-        ws.column_dimensions['B'].width = 30
+            row += 2
+            ws.cell(row=row, column=1, value="删除 Sheet 列表:").font = Font(color="CC0000", bold=True)
+            for name in self.stats['removed_sheets']:
+                row += 1
+                c = ws.cell(row=row, column=1, value=name)
+                c.font = Font(color="CC0000")
+                self._add_comment(c, "【已删除，旧版中存在】")
 
-
-def col_letter_idx(letter):
-    """将列字母转换为列号（如 A->1, Z->26）"""
-    from openpyxl.utils import column_index_from_string
-    return column_index_from_string(letter)
+        ws.column_dimensions['A'].width = 30
+        ws.column_dimensions['B'].width = 18
 
 
 # ---------------------------- GUI ----------------------------
