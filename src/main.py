@@ -13,6 +13,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Border, Alignment, Side
 from openpyxl.comments import Comment
 from openpyxl.utils import get_column_letter
+from openpyxl.cell.cell import MergedCell  # 导入用于类型判断
 
 # ---------------------------- 核心对比引擎 ----------------------------
 class ExcelDiffEngine:
@@ -70,8 +71,6 @@ class ExcelDiffEngine:
         self.stats['added_sheets'] = sorted(new_set - old_set)
         self.stats['removed_sheets'] = sorted(old_set - new_set)
 
-        # 检测重命名（简单策略：数量相同的增减可能为改名，需人工确认）
-        # 这里只记录，不自动匹配
         if self.stats['added_sheets']:
             self.log(f"新增Sheet: {', '.join(self.stats['added_sheets'])}")
         if self.stats['removed_sheets']:
@@ -88,8 +87,6 @@ class ExcelDiffEngine:
                     else:
                         cell.comment = Comment("[新增Sheet，旧版中不存在]", "ExcelDiff")
 
-        # 为删除的Sheet在汇总中说明（见汇总生成）
-
     def _compare_worksheet(self, old_ws, new_ws, result_ws):
         """对比单个工作表的所有差异，并清空完全相同的单元格"""
         max_row = max(old_ws.max_row, new_ws.max_row)
@@ -103,6 +100,10 @@ class ExcelDiffEngine:
                 old_cell = old_ws.cell(row, col)
                 new_cell = new_ws.cell(row, col)
                 result_cell = result_ws.cell(row, col)
+
+                # 跳过合并单元格中的非左上角单元格（MergedCell 无法修改）
+                if isinstance(result_cell, MergedCell):
+                    continue
 
                 # 检查是否完全相同（值 + 格式 + 合并状态等）
                 if self._is_identical(old_cell, new_cell, old_ws, new_ws):
@@ -215,17 +216,15 @@ class ExcelDiffEngine:
         """处理合并单元格变更"""
         old_merged = set(old_ws.merged_cells.ranges)
         new_merged = set(new_ws.merged_cells.ranges)
-        # 新增的合并区域
+        # 新增的合并区域（只标记左上角单元格）
         for rng in new_merged - old_merged:
-            for row in range(rng.min_row, rng.max_row + 1):
-                for col in range(rng.min_col, rng.max_col + 1):
-                    cell = result_ws.cell(row, col)
-                    cell.fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
-                    if cell.comment:
-                        cell.comment.text += "\n[新增合并区域]"
-                    else:
-                        cell.comment = Comment("[新增合并区域]", "ExcelDiff")
-        # 删除的合并区域（新文件中已无，无法直接标记，可在汇总中说明）
+            cell = result_ws.cell(rng.min_row, rng.min_col)
+            cell.fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
+            if cell.comment:
+                cell.comment.text += "\n[新增合并区域]"
+            else:
+                cell.comment = Comment("[新增合并区域]", "ExcelDiff")
+        # 删除的合并区域在新文件中已不存在，无需额外标记
 
     # -------------------- 格式比较辅助方法 --------------------
     @staticmethod
