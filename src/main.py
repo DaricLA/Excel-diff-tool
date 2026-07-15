@@ -1,8 +1,8 @@
 """
-Excel 差异对比工具（界面优化版）
-- 界面增加输出文件路径和名称设置
-- 注释默认显示（可见）
-- 条件格式差异汇总到A1，不删除条件格式
+Excel 差异对比工具（注释位置修复版）
+- 注释定位到对应单元格附近，不再重叠在左上角
+- 强制显示所有注释，兼容 Excel 2016
+- 条件格式差异检测并汇总到 A1，不损坏原有条件格式
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -13,7 +13,7 @@ from datetime import datetime
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Border, Alignment
 from openpyxl.comments import Comment
-from openpyxl.utils import column_index_from_string
+from openpyxl.utils import column_index_from_string, coordinate_to_tuple
 from openpyxl.cell.cell import MergedCell
 from openpyxl.cell.rich_text import CellRichText
 from openpyxl.worksheet.cell_range import MultiCellRange
@@ -30,7 +30,8 @@ class ExcelDiffEngine:
             'diff_cells': 0,
             'added_sheets': [],
             'removed_sheets': [],
-            'sheets_with_diff': set()
+            'sheets_with_diff': set(),
+            'cf_diff_sheets': []
         }
 
     def compare_and_save(self, output_path):
@@ -53,7 +54,7 @@ class ExcelDiffEngine:
 
             has_diff = self._compare_worksheet(old_ws, new_ws, result_ws)
             has_dim_diff = self._compare_row_col_dimensions(old_ws, new_ws, result_ws)
-            has_cf_diff = self._compare_conditional_formatting(old_ws, new_ws, result_ws)
+            has_cf_diff = self._compare_conditional_formatting(old_ws, new_ws, result_ws, sheet_name)
 
             if has_diff or has_dim_diff or has_cf_diff:
                 self.stats['sheets_with_diff'].add(sheet_name)
@@ -64,17 +65,8 @@ class ExcelDiffEngine:
                 del result_wb[name]
                 self.log(f"删除无差异工作表: {name}")
 
-        # 强制注释可见并设置尺寸
-        for ws in result_wb.worksheets:
-            for row in ws.iter_rows():
-                for cell in row:
-                    if cell.comment:
-                        cell.comment.visible = True
-                        # 确保宽高有效
-                        if not cell.comment.width:
-                            cell.comment.width = 300
-                        if not cell.comment.height:
-                            cell.comment.height = 150
+        # 统一设置注释显示及位置（保存前再次确保）
+        self._finalize_comments(result_wb)
 
         self.progress(95, "生成汇总...")
         self._add_summary(result_wb)
@@ -84,6 +76,30 @@ class ExcelDiffEngine:
         self.progress(100, "完成")
         self.log(f"对比完成，结果保存至: {output_path}")
         self.log(f"统计：共检查 {self.stats['total_cells']} 单元格，{self.stats['diff_cells']} 处差异")
+
+    def _finalize_comments(self, wb):
+        """遍历所有工作表，强制显示注释并修正位置"""
+        for ws in wb.worksheets:
+            # 工作表级注释显示
+            if not ws.views.sheetView:
+                from openpyxl.worksheet.views import SheetView
+                ws.views.sheetView.append(SheetView())
+            ws.views.sheetView[0].showComments = True
+
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.comment:
+                        cell.comment.visible = True
+                        # 如果尺寸未设置，给予默认值
+                        if not cell.comment.width:
+                            cell.comment.width = 350
+                        if not cell.comment.height:
+                            cell.comment.height = 150
+                        # 如果位置未设置（left/top为0或None），根据单元格行列计算
+                        if not cell.comment.left or cell.comment.left == 0:
+                            cell.comment.left = 120000 + (cell.column - 1) * 800000
+                        if not cell.comment.top or cell.comment.top == 0:
+                            cell.comment.top = 50000 + (cell.row - 1) * 400000
 
     def _compare_sheets(self, old_wb, new_wb, result_wb):
         old_set = set(old_wb.sheetnames)
@@ -379,7 +395,7 @@ class ExcelDiffEngine:
                     self._add_comment(result_ws.cell(row=1, column=col), f"列宽新设置: {nw}")
         return changed
 
-    def _compare_conditional_formatting(self, old_ws, new_ws, result_ws):
+    def _compare_conditional_formatting(self, old_ws, new_ws, result_ws, sheet_name):
         old_cfs = list(old_ws.conditional_formatting)
         new_cfs = list(new_ws.conditional_formatting)
 
@@ -395,7 +411,7 @@ class ExcelDiffEngine:
         if old_set == new_set:
             return False
         else:
-            # 汇总到A1
+            self.stats['cf_diff_sheets'].append(sheet_name)
             diff_ranges = []
             for cf in new_cfs:
                 ranges_obj = cf.sqref
@@ -404,16 +420,16 @@ class ExcelDiffEngine:
                 else:
                     range_strs = str(ranges_obj).split()
                 diff_ranges.extend(range_strs)
-            # 去重并排序
             diff_ranges = sorted(set(diff_ranges), key=lambda x: x)
             a1_cell = result_ws.cell(row=1, column=1)
-            comment_text = "【条件格式有变更，涉及范围: " + ", ".join(diff_ranges) + "】"
+            comment_text = "【条件格式有变更】\n涉及范围: " + ", ".join(diff_ranges)
             self._add_comment(a1_cell, comment_text)
             a1_cell.fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
             return True
 
     def _add_comment(self, cell, text):
         if cell.comment:
+            # 追加内容，保持原有位置
             cell.comment.text += "\n" + text
             lines = cell.comment.text.count("\n") + 1
             cell.comment.width = 350
@@ -424,6 +440,10 @@ class ExcelDiffEngine:
             lines = text.count("\n") + 1
             comment.width = 350
             comment.height = max(120, lines * 18)
+            # 根据单元格行列设置注释位置（EMU 单位）
+            # 大约：每列 800000 EMU，每行 400000 EMU
+            comment.left = 120000 + (cell.column - 1) * 800000
+            comment.top = 50000 + (cell.row - 1) * 400000
             cell.comment = comment
 
     def _add_summary(self, result_wb):
@@ -457,6 +477,7 @@ class ExcelDiffEngine:
             ("差异单元格数", self.stats['diff_cells']),
             ("新增 Sheet", len(self.stats['added_sheets'])),
             ("删除 Sheet", len(self.stats['removed_sheets'])),
+            ("条件格式差异 Sheet 数", len(self.stats['cf_diff_sheets'])),
         ]
         for i, (label, val) in enumerate(stats, 8):
             ws.cell(row=i, column=1, value=label)
@@ -475,8 +496,14 @@ class ExcelDiffEngine:
             for name in self.stats['removed_sheets']:
                 row += 1
                 ws.cell(row=row, column=1, value=name).font = Font(color="CC0000")
+        if self.stats['cf_diff_sheets']:
+            row += 2
+            ws.cell(row=row, column=1, value="条件格式差异 Sheet 列表:").font = Font(color="FF8C00", bold=True)
+            for name in self.stats['cf_diff_sheets']:
+                row += 1
+                ws.cell(row=row, column=1, value=name).font = Font(color="FF8C00")
 
-        ws.column_dimensions['A'].width = 30
+        ws.column_dimensions['A'].width = 35
         ws.column_dimensions['B'].width = 18
 
 
@@ -493,7 +520,6 @@ class ExcelDiffApp:
         main_frame = ttk.Frame(root, padding=10)
         main_frame.pack(fill='both', expand=True)
 
-        # 左侧对比按钮
         left_frame = ttk.Frame(main_frame)
         left_frame.grid(row=0, column=0, sticky='ns', padx=(0, 10))
 
@@ -508,12 +534,10 @@ class ExcelDiffApp:
         )
         self.compare_btn.pack(expand=True, fill='both')
 
-        # 右侧设置区域
         right_frame = ttk.Frame(main_frame)
         right_frame.grid(row=0, column=1, sticky='nsew')
         right_frame.columnconfigure(1, weight=1)
 
-        # 旧版文件行
         ttk.Label(right_frame, text="旧版文件:", font=("微软雅黑", 10)).grid(row=0, column=0, sticky='w', pady=5)
         self.old_path = tk.StringVar()
         old_entry = ttk.Entry(right_frame, textvariable=self.old_path, font=("微软雅黑", 10), width=55)
@@ -522,7 +546,6 @@ class ExcelDiffApp:
                             command=lambda: self.browse(self.old_path))
         old_btn.grid(row=0, column=2, padx=2)
 
-        # 新版文件行
         ttk.Label(right_frame, text="新版文件:", font=("微软雅黑", 10)).grid(row=1, column=0, sticky='w', pady=5)
         self.new_path = tk.StringVar()
         new_entry = ttk.Entry(right_frame, textvariable=self.new_path, font=("微软雅黑", 10), width=55)
@@ -531,7 +554,6 @@ class ExcelDiffApp:
                             command=lambda: self.browse(self.new_path))
         new_btn.grid(row=1, column=2, padx=2)
 
-        # 输出文件行
         ttk.Label(right_frame, text="输出文件:", font=("微软雅黑", 10)).grid(row=2, column=0, sticky='w', pady=5)
         self.output_path = tk.StringVar(value=os.path.join(os.getcwd(), "对比结果.xlsx"))
         output_entry = ttk.Entry(right_frame, textvariable=self.output_path, font=("微软雅黑", 10), width=55)
@@ -540,11 +562,9 @@ class ExcelDiffApp:
                                command=self.browse_output)
         output_btn.grid(row=2, column=2, padx=2)
 
-        # 进度条
         self.progress = ttk.Progressbar(root, mode='determinate')
         self.progress.pack(fill='x', padx=10, pady=(5, 0))
 
-        # 日志区域
         self.log_area = scrolledtext.ScrolledText(root, height=12, font=("微软雅黑", 10))
         self.log_area.pack(fill='both', expand=True, padx=10, pady=10)
 
@@ -582,13 +602,11 @@ class ExcelDiffApp:
             messagebox.showerror("错误", "请选择旧版和新版Excel文件")
             return
         if not output:
-            # 如果未指定输出路径，则弹出保存对话框
             output = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
             if not output:
                 return
             self.output_path.set(output)
 
-        # 确保输出目录存在
         out_dir = os.path.dirname(output)
         if out_dir and not os.path.exists(out_dir):
             try:
