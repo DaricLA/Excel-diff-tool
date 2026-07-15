@@ -1,7 +1,8 @@
 """
-Excel 差异对比工具（修复版）
-- 修复 ConditionalFormattingList 无 clear 方法的问题
-- 优化界面布局
+Excel 差异对比工具（界面优化版）
+- 界面增加输出文件路径和名称设置
+- 注释默认显示（可见）
+- 条件格式差异汇总到A1，不删除条件格式
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -63,12 +64,17 @@ class ExcelDiffEngine:
                 del result_wb[name]
                 self.log(f"删除无差异工作表: {name}")
 
-        # 强制注释可见
+        # 强制注释可见并设置尺寸
         for ws in result_wb.worksheets:
             for row in ws.iter_rows():
                 for cell in row:
                     if cell.comment:
                         cell.comment.visible = True
+                        # 确保宽高有效
+                        if not cell.comment.width:
+                            cell.comment.width = 300
+                        if not cell.comment.height:
+                            cell.comment.height = 150
 
         self.progress(95, "生成汇总...")
         self._add_summary(result_wb)
@@ -387,28 +393,23 @@ class ExcelDiffEngine:
         new_set = {serialize(c) for c in new_cfs}
 
         if old_set == new_set:
-            # 完全相同：清空条件格式（通过赋值为新的空列表）
-            result_ws.conditional_formatting = type(result_ws.conditional_formatting)()
             return False
         else:
+            # 汇总到A1
+            diff_ranges = []
             for cf in new_cfs:
                 ranges_obj = cf.sqref
                 if isinstance(ranges_obj, MultiCellRange):
                     range_strs = [str(r) for r in ranges_obj.ranges]
                 else:
                     range_strs = str(ranges_obj).split()
-                for rng_str in range_strs:
-                    if ':' in rng_str:
-                        start = rng_str.split(':')[0]
-                    else:
-                        start = rng_str
-                    from openpyxl.utils import coordinate_to_tuple
-                    try:
-                        row, col = coordinate_to_tuple(start)
-                        cell = result_ws.cell(row=row, column=col)
-                        self._add_comment(cell, "【条件格式有变更】")
-                    except:
-                        pass
+                diff_ranges.extend(range_strs)
+            # 去重并排序
+            diff_ranges = sorted(set(diff_ranges), key=lambda x: x)
+            a1_cell = result_ws.cell(row=1, column=1)
+            comment_text = "【条件格式有变更，涉及范围: " + ", ".join(diff_ranges) + "】"
+            self._add_comment(a1_cell, comment_text)
+            a1_cell.fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
             return True
 
     def _add_comment(self, cell, text):
@@ -484,7 +485,7 @@ class ExcelDiffApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Excel 差异对比工具")
-        self.root.geometry("750x450")
+        self.root.geometry("750x500")
 
         default_font = ("微软雅黑", 10)
         self.root.option_add("*Font", default_font)
@@ -492,6 +493,7 @@ class ExcelDiffApp:
         main_frame = ttk.Frame(root, padding=10)
         main_frame.pack(fill='both', expand=True)
 
+        # 左侧对比按钮
         left_frame = ttk.Frame(main_frame)
         left_frame.grid(row=0, column=0, sticky='ns', padx=(0, 10))
 
@@ -506,10 +508,12 @@ class ExcelDiffApp:
         )
         self.compare_btn.pack(expand=True, fill='both')
 
+        # 右侧设置区域
         right_frame = ttk.Frame(main_frame)
         right_frame.grid(row=0, column=1, sticky='nsew')
         right_frame.columnconfigure(1, weight=1)
 
+        # 旧版文件行
         ttk.Label(right_frame, text="旧版文件:", font=("微软雅黑", 10)).grid(row=0, column=0, sticky='w', pady=5)
         self.old_path = tk.StringVar()
         old_entry = ttk.Entry(right_frame, textvariable=self.old_path, font=("微软雅黑", 10), width=55)
@@ -518,6 +522,7 @@ class ExcelDiffApp:
                             command=lambda: self.browse(self.old_path))
         old_btn.grid(row=0, column=2, padx=2)
 
+        # 新版文件行
         ttk.Label(right_frame, text="新版文件:", font=("微软雅黑", 10)).grid(row=1, column=0, sticky='w', pady=5)
         self.new_path = tk.StringVar()
         new_entry = ttk.Entry(right_frame, textvariable=self.new_path, font=("微软雅黑", 10), width=55)
@@ -526,9 +531,20 @@ class ExcelDiffApp:
                             command=lambda: self.browse(self.new_path))
         new_btn.grid(row=1, column=2, padx=2)
 
+        # 输出文件行
+        ttk.Label(right_frame, text="输出文件:", font=("微软雅黑", 10)).grid(row=2, column=0, sticky='w', pady=5)
+        self.output_path = tk.StringVar(value=os.path.join(os.getcwd(), "对比结果.xlsx"))
+        output_entry = ttk.Entry(right_frame, textvariable=self.output_path, font=("微软雅黑", 10), width=55)
+        output_entry.grid(row=2, column=1, padx=5, sticky='ew')
+        output_btn = tk.Button(right_frame, text="浏览", bg="#FF9800", fg="white", font=("微软雅黑", 9, "bold"),
+                               command=self.browse_output)
+        output_btn.grid(row=2, column=2, padx=2)
+
+        # 进度条
         self.progress = ttk.Progressbar(root, mode='determinate')
         self.progress.pack(fill='x', padx=10, pady=(5, 0))
 
+        # 日志区域
         self.log_area = scrolledtext.ScrolledText(root, height=12, font=("微软雅黑", 10))
         self.log_area.pack(fill='both', expand=True, padx=10, pady=10)
 
@@ -536,6 +552,15 @@ class ExcelDiffApp:
         filename = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xls")])
         if filename:
             var.set(filename)
+
+    def browse_output(self):
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+            initialfile="对比结果.xlsx"
+        )
+        if filename:
+            self.output_path.set(filename)
 
     def log(self, msg):
         self.log_area.insert('end', f"[{datetime.now():%H:%M:%S}] {msg}\n")
@@ -551,12 +576,27 @@ class ExcelDiffApp:
     def start(self):
         old = self.old_path.get()
         new = self.new_path.get()
+        output = self.output_path.get()
+
         if not old or not new:
-            messagebox.showerror("错误", "请选择两个Excel文件")
+            messagebox.showerror("错误", "请选择旧版和新版Excel文件")
             return
-        output = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
         if not output:
-            return
+            # 如果未指定输出路径，则弹出保存对话框
+            output = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
+            if not output:
+                return
+            self.output_path.set(output)
+
+        # 确保输出目录存在
+        out_dir = os.path.dirname(output)
+        if out_dir and not os.path.exists(out_dir):
+            try:
+                os.makedirs(out_dir)
+            except Exception as e:
+                messagebox.showerror("错误", f"无法创建输出目录: {e}")
+                return
+
         threading.Thread(target=self.run, args=(old, new, output), daemon=True).start()
 
     def run(self, old, new, output):
