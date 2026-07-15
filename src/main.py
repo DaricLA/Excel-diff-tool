@@ -1,7 +1,8 @@
 """
-Excel 差异对比工具（注释类型修复版）
-- 修复 CommentRecord.text 类型错误
-- 注释定位、显示、编辑功能正常
+Excel 差异对比工具（稳定修复版）
+- 移除对 Comment 的底层操作，使用标准 API
+- 加载文件时关闭外部链接（keep_links=False），避免更新链接警告
+- 不修改结果文件的条件格式，仅检测并记录日志
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -12,12 +13,9 @@ from datetime import datetime
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Border, Alignment
 from openpyxl.comments import Comment
-from openpyxl.comments.comment_sheet import CommentRecord
-from openpyxl.cell.text import Text  # 用于包装注释文本
 from openpyxl.utils import column_index_from_string, coordinate_to_tuple
 from openpyxl.cell.cell import MergedCell
 from openpyxl.cell.rich_text import CellRichText
-from openpyxl.worksheet.cell_range import MultiCellRange
 
 # ---------------------------- 核心对比引擎 ----------------------------
 class ExcelDiffEngine:
@@ -31,16 +29,16 @@ class ExcelDiffEngine:
             'diff_cells': 0,
             'added_sheets': [],
             'removed_sheets': [],
-            'sheets_with_diff': set(),
-            'cf_diff_sheets': []
+            'sheets_with_diff': set()
         }
 
     def compare_and_save(self, output_path):
         self.progress(5, "加载文件中...")
-        self.log("正在加载工作簿...")
-        old_wb = load_workbook(self.old_path)
-        new_wb = load_workbook(self.new_path)
-        result_wb = load_workbook(self.new_path)
+        self.log("正在加载工作簿（已忽略外部链接）...")
+        # 关闭外部链接，避免打开文件时出现更新链接警告
+        old_wb = load_workbook(self.old_path, keep_links=False)
+        new_wb = load_workbook(self.new_path, keep_links=False)
+        result_wb = load_workbook(self.new_path, keep_links=False)
 
         self._compare_sheets(old_wb, new_wb, result_wb)
 
@@ -55,7 +53,9 @@ class ExcelDiffEngine:
 
             has_diff = self._compare_worksheet(old_ws, new_ws, result_ws)
             has_dim_diff = self._compare_row_col_dimensions(old_ws, new_ws, result_ws)
-            has_cf_diff = self._compare_conditional_formatting(old_ws, new_ws, result_ws, sheet_name)
+
+            # 条件格式仅检测，不修改
+            has_cf_diff = self._detect_conditional_formatting_diff(old_ws, new_ws, sheet_name)
 
             if has_diff or has_dim_diff or has_cf_diff:
                 self.stats['sheets_with_diff'].add(sheet_name)
@@ -66,8 +66,14 @@ class ExcelDiffEngine:
                 del result_wb[name]
                 self.log(f"删除无差异工作表: {name}")
 
-        # 确保注释功能正常
-        self._fix_comments(result_wb)
+        # 设置注释显示（标准方式）
+        for ws in result_wb.worksheets:
+            if ws.views.sheetView:
+                ws.views.sheetView[0].showComments = True
+            else:
+                from openpyxl.worksheet.views import SheetView
+                sv = SheetView(showComments=True)
+                ws.views.sheetView.append(sv)
 
         self.progress(95, "生成汇总...")
         self._add_summary(result_wb)
@@ -77,41 +83,6 @@ class ExcelDiffEngine:
         self.progress(100, "完成")
         self.log(f"对比完成，结果保存至: {output_path}")
         self.log(f"统计：共检查 {self.stats['total_cells']} 单元格，{self.stats['diff_cells']} 处差异")
-
-    def _fix_comments(self, wb):
-        """修复注释在 Excel 2016 中的显示和编辑问题"""
-        for ws in wb.worksheets:
-            if not ws.views.sheetView:
-                from openpyxl.worksheet.views import SheetView
-                ws.views.sheetView.append(SheetView())
-            ws.views.sheetView[0].showComments = True
-
-            for row in ws.iter_rows():
-                for cell in row:
-                    if cell.comment:
-                        comment = cell.comment
-                        comment.visible = True
-                        if not comment.author:
-                            comment.author = "ExcelDiff"
-                        if not comment.width or comment.width < 100:
-                            comment.width = 350
-                        if not comment.height or comment.height < 50:
-                            text_lines = comment.text.count("\n") + 1 if comment.text else 1
-                            comment.height = max(120, text_lines * 18)
-                        if not comment.left or comment.left == 0:
-                            comment.left = 120000 + (cell.column - 1) * 800000
-                        if not comment.top or comment.top == 0:
-                            comment.top = 50000 + (cell.row - 1) * 400000
-                        # 确保底层 CommentRecord 完整，使用 Text 对象
-                        if not hasattr(comment, '_comment') or comment._comment is None:
-                            comment._comment = CommentRecord()
-                        comment._comment.author = comment.author
-                        comment._comment.text = Text(comment.text)  # 包装为 Text 对象
-                        comment._comment.width = comment.width
-                        comment._comment.height = comment.height
-                        comment._comment.left = comment.left
-                        comment._comment.top = comment.top
-                        comment._comment.visible = True
 
     def _compare_sheets(self, old_wb, new_wb, result_wb):
         old_set = set(old_wb.sheetnames)
@@ -157,6 +128,7 @@ class ExcelDiffEngine:
                     continue
 
                 if self._is_identical(old_cell, new_cell, old_ws, new_ws):
+                    # 完全相同则清空
                     result_cell.value = None
                     result_cell.font = Font()
                     result_cell.fill = PatternFill()
@@ -407,7 +379,8 @@ class ExcelDiffEngine:
                     self._add_comment(result_ws.cell(row=1, column=col), f"列宽新设置: {nw}")
         return changed
 
-    def _compare_conditional_formatting(self, old_ws, new_ws, result_ws, sheet_name):
+    def _detect_conditional_formatting_diff(self, old_ws, new_ws, sheet_name):
+        """仅检测条件格式差异，不修改结果文件的条件格式"""
         old_cfs = list(old_ws.conditional_formatting)
         new_cfs = list(new_ws.conditional_formatting)
 
@@ -420,56 +393,29 @@ class ExcelDiffEngine:
         old_set = {serialize(c) for c in old_cfs}
         new_set = {serialize(c) for c in new_cfs}
 
-        if old_set == new_set:
-            return False
-        else:
-            self.stats['cf_diff_sheets'].append(sheet_name)
-            diff_ranges = []
-            for cf in new_cfs:
-                ranges_obj = cf.sqref
-                if isinstance(ranges_obj, MultiCellRange):
-                    range_strs = [str(r) for r in ranges_obj.ranges]
-                else:
-                    range_strs = str(ranges_obj).split()
-                diff_ranges.extend(range_strs)
-            diff_ranges = sorted(set(diff_ranges), key=lambda x: x)
-            a1_cell = result_ws.cell(row=1, column=1)
-            comment_text = "【条件格式有变更】\n涉及范围: " + ", ".join(diff_ranges)
-            self._add_comment(a1_cell, comment_text)
-            a1_cell.fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        if old_set != new_set:
+            self.log(f"Sheet '{sheet_name}' 条件格式有差异（不影响原文件）")
             return True
+        return False
 
     def _add_comment(self, cell, text):
+        """标准方式添加注释，使用 openpyxl 默认 API，不操作内部对象"""
         if cell.comment:
-            # 追加内容
-            cell.comment.text += "\n" + text
-            lines = cell.comment.text.count("\n") + 1
-            cell.comment.width = 350
-            cell.comment.height = max(120, lines * 18)
-            # 更新底层 CommentRecord
-            if hasattr(cell.comment, '_comment') and cell.comment._comment:
-                cell.comment._comment.text = Text(cell.comment.text)
-                cell.comment._comment.width = cell.comment.width
-                cell.comment._comment.height = cell.comment.height
+            # 追加内容：重新创建注释以确保尺寸和位置正确
+            old_text = cell.comment.text
+            new_text = old_text + "\n" + text
+            comment = Comment(new_text, "ExcelDiff")
         else:
             comment = Comment(text, "ExcelDiff")
-            comment.visible = True
-            lines = text.count("\n") + 1
-            comment.width = 350
-            comment.height = max(120, lines * 18)
-            comment.left = 120000 + (cell.column - 1) * 800000
-            comment.top = 50000 + (cell.row - 1) * 400000
-            # 初始化底层 CommentRecord，使用 Text 包装
-            if not hasattr(comment, '_comment') or comment._comment is None:
-                comment._comment = CommentRecord()
-            comment._comment.author = comment.author
-            comment._comment.text = Text(comment.text)
-            comment._comment.width = comment.width
-            comment._comment.height = comment.height
-            comment._comment.left = comment.left
-            comment._comment.top = comment.top
-            comment._comment.visible = True
-            cell.comment = comment
+
+        comment.visible = True
+        lines = comment.text.count("\n") + 1
+        comment.width = 350
+        comment.height = max(120, lines * 18)
+        # 设置位置
+        comment.left = 120000 + (cell.column - 1) * 800000
+        comment.top = 50000 + (cell.row - 1) * 400000
+        cell.comment = comment
 
     def _add_summary(self, result_wb):
         if "差异汇总" in result_wb.sheetnames:
@@ -502,7 +448,6 @@ class ExcelDiffEngine:
             ("差异单元格数", self.stats['diff_cells']),
             ("新增 Sheet", len(self.stats['added_sheets'])),
             ("删除 Sheet", len(self.stats['removed_sheets'])),
-            ("条件格式差异 Sheet 数", len(self.stats['cf_diff_sheets'])),
         ]
         for i, (label, val) in enumerate(stats, 8):
             ws.cell(row=i, column=1, value=label)
@@ -521,12 +466,6 @@ class ExcelDiffEngine:
             for name in self.stats['removed_sheets']:
                 row += 1
                 ws.cell(row=row, column=1, value=name).font = Font(color="CC0000")
-        if self.stats['cf_diff_sheets']:
-            row += 2
-            ws.cell(row=row, column=1, value="条件格式差异 Sheet 列表:").font = Font(color="FF8C00", bold=True)
-            for name in self.stats['cf_diff_sheets']:
-                row += 1
-                ws.cell(row=row, column=1, value=name).font = Font(color="FF8C00")
 
         ws.column_dimensions['A'].width = 35
         ws.column_dimensions['B'].width = 18
