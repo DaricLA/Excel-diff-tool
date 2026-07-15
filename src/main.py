@@ -1,8 +1,7 @@
 """
-Excel 差异对比工具（注释功能修复版）
-- 修复注释在 Excel 2016 中无法编辑、显示选项灰色的问题
-- 使用 VML 注释格式，正确设置所有必要属性
-- 注释定位到对应单元格附近
+Excel 差异对比工具（注释类型修复版）
+- 修复 CommentRecord.text 类型错误
+- 注释定位、显示、编辑功能正常
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -14,6 +13,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Border, Alignment
 from openpyxl.comments import Comment
 from openpyxl.comments.comment_sheet import CommentRecord
+from openpyxl.cell.text import Text  # 用于包装注释文本
 from openpyxl.utils import column_index_from_string, coordinate_to_tuple
 from openpyxl.cell.cell import MergedCell
 from openpyxl.cell.rich_text import CellRichText
@@ -81,43 +81,37 @@ class ExcelDiffEngine:
     def _fix_comments(self, wb):
         """修复注释在 Excel 2016 中的显示和编辑问题"""
         for ws in wb.worksheets:
-            # 启用工作表级注释显示
             if not ws.views.sheetView:
                 from openpyxl.worksheet.views import SheetView
                 ws.views.sheetView.append(SheetView())
             ws.views.sheetView[0].showComments = True
 
-            # 遍历所有单元格注释，确保属性完整
             for row in ws.iter_rows():
                 for cell in row:
                     if cell.comment:
                         comment = cell.comment
-                        # 确保 visible 属性
                         comment.visible = True
-                        # 确保作者不为空
                         if not comment.author:
                             comment.author = "ExcelDiff"
-                        # 设置合理的尺寸
                         if not comment.width or comment.width < 100:
                             comment.width = 350
                         if not comment.height or comment.height < 50:
                             text_lines = comment.text.count("\n") + 1 if comment.text else 1
                             comment.height = max(120, text_lines * 18)
-                        # 计算注释位置（相对于单元格）
                         if not comment.left or comment.left == 0:
                             comment.left = 120000 + (cell.column - 1) * 800000
                         if not comment.top or comment.top == 0:
                             comment.top = 50000 + (cell.row - 1) * 400000
-                        # 确保注释记录存在
+                        # 确保底层 CommentRecord 完整，使用 Text 对象
                         if not hasattr(comment, '_comment') or comment._comment is None:
                             comment._comment = CommentRecord()
-                            comment._comment.author = comment.author
-                            comment._comment.text = comment.text
-                            comment._comment.width = comment.width
-                            comment._comment.height = comment.height
-                            comment._comment.left = comment.left
-                            comment._comment.top = comment.top
-                            comment._comment.visible = True
+                        comment._comment.author = comment.author
+                        comment._comment.text = Text(comment.text)  # 包装为 Text 对象
+                        comment._comment.width = comment.width
+                        comment._comment.height = comment.height
+                        comment._comment.left = comment.left
+                        comment._comment.top = comment.top
+                        comment._comment.visible = True
 
     def _compare_sheets(self, old_wb, new_wb, result_wb):
         old_set = set(old_wb.sheetnames)
@@ -447,10 +441,16 @@ class ExcelDiffEngine:
 
     def _add_comment(self, cell, text):
         if cell.comment:
+            # 追加内容
             cell.comment.text += "\n" + text
             lines = cell.comment.text.count("\n") + 1
             cell.comment.width = 350
             cell.comment.height = max(120, lines * 18)
+            # 更新底层 CommentRecord
+            if hasattr(cell.comment, '_comment') and cell.comment._comment:
+                cell.comment._comment.text = Text(cell.comment.text)
+                cell.comment._comment.width = cell.comment.width
+                cell.comment._comment.height = cell.comment.height
         else:
             comment = Comment(text, "ExcelDiff")
             comment.visible = True
@@ -459,11 +459,11 @@ class ExcelDiffEngine:
             comment.height = max(120, lines * 18)
             comment.left = 120000 + (cell.column - 1) * 800000
             comment.top = 50000 + (cell.row - 1) * 400000
-            # 预初始化 CommentRecord 确保 XML 序列化完整
+            # 初始化底层 CommentRecord，使用 Text 包装
             if not hasattr(comment, '_comment') or comment._comment is None:
                 comment._comment = CommentRecord()
             comment._comment.author = comment.author
-            comment._comment.text = comment.text
+            comment._comment.text = Text(comment.text)
             comment._comment.width = comment.width
             comment._comment.height = comment.height
             comment._comment.left = comment.left
