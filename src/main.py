@@ -1,7 +1,5 @@
 """
-Excel 差异对比工具（手动打开文件 - 修复 Address 调用错误）
-- 修复了 win32com 中 Address 属性无法当作方法调用的问题
-- 使用 .Address 属性并手动去除 $ 符号
+Excel 差异对比工具（优化版：进度反馈、可取消）
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -14,7 +12,6 @@ from win32com.client import constants
 
 # ---------------------------- 辅助函数 ----------------------------
 def rgb_to_hex(rgb):
-    """BGR 整数 -> #RRGGBB 字符串"""
     b = (rgb >> 0) & 0xFF
     g = (rgb >> 8) & 0xFF
     r = (rgb >> 16) & 0xFF
@@ -37,20 +34,19 @@ def find_workbook(excel_app, target_path):
     return None
 
 def cell_address(cell):
-    """获取单元格的相对地址（无$符号），例如 A1"""
     try:
-        # 获取默认地址（带$），然后替换掉$
         return cell.Address.replace("$", "")
     except:
         return "?"
 
-# ---------------------------- 对比引擎（子线程独立 Excel 实例） ----------------------------
+# ---------------------------- 对比引擎 ----------------------------
 class ExcelComparer:
-    def __init__(self, old_path, new_path, log_callback=None, progress_callback=None):
+    def __init__(self, old_path, new_path, log_callback=None, progress_callback=None, cancel_event=None):
         self.old_path = old_path
         self.new_path = new_path
         self.log = log_callback if log_callback else print
         self.progress = progress_callback if progress_callback else lambda v,s: None
+        self.cancel_event = cancel_event or threading.Event()
         self.diffs = []
         self.sheet_diffs = []
         self.stats = {
@@ -64,12 +60,7 @@ class ExcelComparer:
         try:
             excel = win32com.client.GetObject(Class="Excel.Application")
             self.log("子线程已连接到 Excel")
-            wb_paths = []
-            for wb in excel.Workbooks:
-                try:
-                    wb_paths.append(wb.FullName)
-                except:
-                    wb_paths.append("?")
+            wb_paths = [wb.FullName for wb in excel.Workbooks]
             self.log(f"Excel 中打开的文件: {wb_paths}")
 
             old_wb = find_workbook(excel, self.old_path)
@@ -85,6 +76,9 @@ class ExcelComparer:
             common = set(old_sheets.keys()) & set(new_sheets.keys())
             total = len(common)
             for idx, name in enumerate(common, 1):
+                if self.cancel_event.is_set():
+                    self.log("用户取消了对比")
+                    return False
                 self.progress(10 + 80*idx//total, f"对比 {name} ({idx}/{total})")
                 self.log(f"处理 {name}")
                 self._compare_worksheet(old_sheets[name], new_sheets[name], name)
@@ -108,18 +102,37 @@ class ExcelComparer:
         for name in self.stats['removed_sheets']:
             self.sheet_diffs.append({'type':'删除Sheet','name':name,'old_name':name,'new_name':None,'desc':f'Sheet "{name}" 只存在于旧版'})
 
+    def _get_real_used_range(self, ws):
+        """获取真正使用的区域，减少空单元格遍历"""
+        try:
+            # 尝试使用 SpecialCells 定位最后一个单元格
+            last_cell = ws.Cells.SpecialCells(11)  # xlCellTypeLastCell
+            max_row = last_cell.Row
+            max_col = last_cell.Column
+            return max_row, max_col
+        except:
+            # 回退到 UsedRange
+            used = ws.UsedRange
+            return used.Row + used.Rows.Count - 1, used.Column + used.Columns.Count - 1
+
     def _compare_worksheet(self, old_ws, new_ws, sheet_name):
-        old_used = old_ws.UsedRange
-        new_used = new_ws.UsedRange
-        old_max_row = old_used.Row + old_used.Rows.Count - 1
-        old_max_col = old_used.Column + old_used.Columns.Count - 1
-        new_max_row = new_used.Row + new_used.Rows.Count - 1
-        new_max_col = new_used.Column + new_used.Columns.Count - 1
+        old_max_row, old_max_col = self._get_real_used_range(old_ws)
+        new_max_row, new_max_col = self._get_real_used_range(new_ws)
         max_row = max(old_max_row, new_max_row)
         max_col = max(old_max_col, new_max_col)
 
-        for r in range(1, max_row+1):
-            for c in range(1, max_col+1):
+        # 进度输出间隔
+        report_interval = max(1, max_row // 20)  # 最少每 5% 输出一次
+        last_reported = 0
+
+        for r in range(1, max_row + 1):
+            if self.cancel_event.is_set():
+                return
+            # 每 report_interval 行或最后一行输出进度
+            if r - last_reported >= report_interval or r == max_row:
+                self.log(f"  {sheet_name}: 行 {r}/{max_row}")
+                last_reported = r
+            for c in range(1, max_col + 1):
                 old_cell = old_ws.Cells(r, c) if r <= old_max_row and c <= old_max_col else None
                 new_cell = new_ws.Cells(r, c) if r <= new_max_row and c <= new_max_col else None
                 addr = cell_address(old_cell) if old_cell else cell_address(new_cell)
@@ -133,6 +146,10 @@ class ExcelComparer:
                         'type': diff['type'],
                         'desc': diff['desc']
                     })
+                # 适当释放 COM 消息，避免 Excel 无响应
+                if self.stats['total_cells'] % 1000 == 0:
+                    pythoncom.PumpWaitingMessages()
+
         self._compare_merged_cells(old_ws, new_ws, sheet_name)
         self._compare_row_col_dimensions(old_ws, new_ws, sheet_name)
         self._compare_images(old_ws, new_ws, sheet_name)
@@ -225,12 +242,10 @@ class ExcelComparer:
             old_imgs = []; new_imgs = []
             for s in old_shapes:
                 if s.Type == 13:
-                    top_left = cell_address(s.TopLeftCell)
-                    old_imgs.append((top_left, s.Width, s.Height))
+                    old_imgs.append((cell_address(s.TopLeftCell), s.Width, s.Height))
             for s in new_shapes:
                 if s.Type == 13:
-                    top_left = cell_address(s.TopLeftCell)
-                    new_imgs.append((top_left, s.Width, s.Height))
+                    new_imgs.append((cell_address(s.TopLeftCell), s.Width, s.Height))
             if old_imgs != new_imgs:
                 self.stats['images_diff'] += 1
                 anchor = old_imgs[0][0] if old_imgs else (new_imgs[0][0] if new_imgs else 'A1')
@@ -245,7 +260,7 @@ class ExcelComparer:
                 self.diffs.append({'sheet':sheet_name,'address':'A1','type':'条件格式数量变化','desc':f'条件格式数量: {oc} → {nc}'})
         except: pass
 
-# ---------------------------- GUI（主线程） ----------------------------
+# ---------------------------- GUI ----------------------------
 class DiffViewer:
     def __init__(self, root):
         self.root = root
@@ -254,6 +269,7 @@ class DiffViewer:
         self.excel_app = None
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
+        self.cancel_event = threading.Event()
 
         top = ttk.Frame(root, padding=10)
         top.pack(fill='x')
@@ -271,6 +287,8 @@ class DiffViewer:
         btn_frame.grid(row=3,column=0,columnspan=3,pady=5)
         self.start_btn = ttk.Button(btn_frame, text="开始对比", command=self.start_compare)
         self.start_btn.pack(side='left',padx=5)
+        self.cancel_btn = ttk.Button(btn_frame, text="取消", command=self.cancel_compare, state='disabled')
+        self.cancel_btn.pack(side='left',padx=5)
         self.jump_btn = ttk.Button(btn_frame, text="跳转到选中项", command=self.jump_to_selected, state='disabled')
         self.jump_btn.pack(side='left',padx=5)
 
@@ -319,23 +337,37 @@ class DiffViewer:
         old = self.old_path.get(); new = self.new_path.get()
         if not old or not new:
             messagebox.showerror("错误","请选择两个文件"); return
+        # 重置取消事件
+        self.cancel_event.clear()
         self.start_btn.configure(state='disabled')
+        self.cancel_btn.configure(state='normal')
         self.tree.delete(*self.tree.get_children())
         self.detail.delete('1.0','end')
         self.diff_items = []
 
         def worker():
             try:
-                comparer = ExcelComparer(old, new, self.log, self.update_progress)
-                comparer.run()
-                self.result_data = (comparer.diffs, comparer.sheet_diffs, comparer.stats)
-                self.root.after(0, self.populate_tree)
+                comparer = ExcelComparer(old, new, self.log, self.update_progress, self.cancel_event)
+                success = comparer.run()
+                if not success:
+                    self.log("对比被取消")
+                else:
+                    self.result_data = (comparer.diffs, comparer.sheet_diffs, comparer.stats)
+                    self.root.after(0, self.populate_tree)
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("对比失败", str(e)))
             finally:
-                self.root.after(0, lambda: self.start_btn.configure(state='normal'))
+                self.root.after(0, self.on_comparison_finished)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def cancel_compare(self):
+        self.cancel_event.set()
+        self.log("正在取消...")
+
+    def on_comparison_finished(self):
+        self.start_btn.configure(state='normal')
+        self.cancel_btn.configure(state='disabled')
 
     def populate_tree(self):
         diffs, sheet_diffs, stats = self.result_data
