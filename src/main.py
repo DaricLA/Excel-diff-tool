@@ -1,10 +1,9 @@
 """
-Excel 差异对比工具（手动打开版）
+Excel 差异对比工具（优化版）
+- 可拖动分隔条，左侧列表初始占2/3，右侧详情占1/3
+- 增强富文本差异检测
+- 使用Goto定位单元格，视觉更醒目
 - 完全由用户手动打开Excel，工具仅检测与跳转
-- 单击差异列表即时更新详情
-- 可靠检测图片增减、尺寸变化
-- 准确识别单元格内局部格式（富文本）差异
-- 界面布局：左侧列表占 2/3，右侧详情占 1/3
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -106,9 +105,11 @@ class OpenpyxlComparer:
     def _get_cell_diff(self, old_cell, new_cell):
         old_val = old_cell.value
         new_val = new_cell.value
+        # 1. 值/公式/富文本差异
         if not self._value_equal(old_val, new_val):
             old_str = f"{old_val}" if old_val is not None else "(空)"
             new_str = f"{new_val}" if new_val is not None else "(空)"
+            # 如果是富文本，生成详细的格式变更描述
             if isinstance(old_val, CellRichText) or isinstance(new_val, CellRichText):
                 rich_desc = self._rich_text_diff(old_val, new_val)
                 return {'type': '内容(含富文本)', 'desc': rich_desc}
@@ -118,6 +119,7 @@ class OpenpyxlComparer:
             else:
                 return {'type': '值变化', 'desc': f'{old_str} → {new_str}'}
 
+        # 2. 格式差异（整体字体、填充等）
         descs = []
         font_diff = self._cmp_font(old_cell.font, new_cell.font)
         if font_diff: descs.append(f"字体: {font_diff}")
@@ -330,6 +332,7 @@ class DiffViewer:
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
 
+        # 顶部文件选择区域
         top = ttk.Frame(root, padding=10)
         top.grid(row=0, column=0, sticky='ew')
         ttk.Label(top, text="旧版文件:", font=("微软雅黑", 10)).grid(row=0,column=0,sticky='w')
@@ -351,16 +354,18 @@ class DiffViewer:
         self.progress = ttk.Progressbar(root, mode='determinate')
         self.progress.grid(row=1, column=0, sticky='ew', padx=10, pady=(5,0))
 
-        main_frame = ttk.Frame(root)
-        main_frame.grid(row=2, column=0, sticky='nsew', padx=10, pady=5)
+        # 可拖动的 PanedWindow：左侧列表，右侧详情
+        paned = ttk.PanedWindow(root, orient='horizontal')
+        paned.grid(row=2, column=0, sticky='nsew', padx=10, pady=5)
         root.grid_rowconfigure(2, weight=1)
         root.grid_columnconfigure(0, weight=1)
 
-        left_frame = ttk.Frame(main_frame)
-        left_frame.grid(row=0, column=0, sticky='nsew')
-        main_frame.grid_columnconfigure(0, weight=2)
-        main_frame.grid_rowconfigure(0, weight=1)
+        left_frame = ttk.Frame(paned)
+        right_frame = ttk.Frame(paned)
+        paned.add(left_frame, weight=2)   # 初始比例 2/3
+        paned.add(right_frame, weight=1)  # 初始比例 1/3
 
+        # 左侧列表
         self.tree = ttk.Treeview(left_frame, columns=('address','type'), show='tree headings')
         self.tree.heading('#0',text='Sheet / 差异项')
         self.tree.heading('address',text='位置')
@@ -368,21 +373,18 @@ class DiffViewer:
         self.tree.column('#0',width=200); self.tree.column('address',width=80); self.tree.column('type',width=120)
         scroll_y = ttk.Scrollbar(left_frame, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll_y.set)
-        self.tree.grid(row=0, column=0, sticky='nsew')
-        scroll_y.grid(row=0, column=1, sticky='ns')
-        left_frame.grid_rowconfigure(0, weight=1)
-        left_frame.grid_columnconfigure(0, weight=1)
+        self.tree.pack(side='left', fill='both', expand=True)
+        scroll_y.pack(side='right', fill='y')
 
         self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
         self.tree.bind('<Double-1>', self.jump_to_selected)
 
-        right_frame = ttk.Frame(main_frame)
-        right_frame.grid(row=0, column=1, sticky='nsew', padx=(5,0))
-        main_frame.grid_columnconfigure(1, weight=1)
+        # 右侧详情
         ttk.Label(right_frame, text="差异详情", font=('微软雅黑',10,'bold')).pack(anchor='w')
         self.detail = tk.Text(right_frame, wrap='word', height=20, font=("微软雅黑", 10))
         self.detail.pack(fill='both',expand=True)
 
+        # 日志区域
         logf = ttk.LabelFrame(root, text="日志", padding=5)
         logf.grid(row=3, column=0, sticky='ew', padx=10, pady=(0,10))
         self.log_text = tk.Text(logf, height=8, wrap='word', font=("微软雅黑", 10))
@@ -492,14 +494,12 @@ class DiffViewer:
         def navigate():
             pythoncom.CoInitialize()
             try:
-                # 尝试获取已运行的 Excel 进程
                 try:
                     excel = win32com.client.GetObject(Class="Excel.Application")
                 except:
                     messagebox.showinfo("提示", "未检测到正在运行的 Excel 进程，请手动打开两个文件后再跳转。")
                     return
 
-                # 检查文件是否已打开
                 old_path = normalize_path(self.old_path.get())
                 new_path = normalize_path(self.new_path.get())
                 old_wb = None
@@ -518,17 +518,16 @@ class DiffViewer:
                     messagebox.showinfo("文件未打开", "以下文件未在 Excel 中打开：\n" + "\n".join(missing) + "\n请手动打开后重试。")
                     return
 
-                # 执行定位
+                # 使用 Goto 定位并居中，视觉效果更醒目
                 for wb, desc in [(old_wb, "旧版"), (new_wb, "新版")]:
                     try:
                         ws = wb.Worksheets(sheet)
                         ws.Activate()
-                        ws.Range(address).Select()
+                        excel.Goto(ws.Range(address), Scroll=True)  # 关键：使用 Goto
                         self.log(f"{desc} 已跳转到 {sheet}!{address}")
                     except Exception as e:
                         self.log(f"{desc} 跳转失败: {e}")
 
-                # 将 Excel 窗口前置
                 excel.Visible = True
                 excel.WindowState = -4137  # xlMaximized
                 self.root.after(100, lambda: self.root.lower())
