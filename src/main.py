@@ -1,8 +1,7 @@
 """
-Excel 差异对比工具（稳定修复版）
-- 移除对 Comment 的底层操作，使用标准 API
-- 加载文件时关闭外部链接（keep_links=False），避免更新链接警告
-- 不修改结果文件的条件格式，仅检测并记录日志
+Excel 差异对比工具（稳定版 + 图片对比）
+- 回退稳定版：输出路径预设，标准注释，不操作内部对象
+- 新增：检测图片有无及尺寸变化
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -29,13 +28,13 @@ class ExcelDiffEngine:
             'diff_cells': 0,
             'added_sheets': [],
             'removed_sheets': [],
-            'sheets_with_diff': set()
+            'sheets_with_diff': set(),
+            'img_diff_sheets': []
         }
 
     def compare_and_save(self, output_path):
         self.progress(5, "加载文件中...")
-        self.log("正在加载工作簿（已忽略外部链接）...")
-        # 关闭外部链接，避免打开文件时出现更新链接警告
+        self.log("正在加载工作簿（忽略外部链接）...")
         old_wb = load_workbook(self.old_path, keep_links=False)
         new_wb = load_workbook(self.new_path, keep_links=False)
         result_wb = load_workbook(self.new_path, keep_links=False)
@@ -53,11 +52,12 @@ class ExcelDiffEngine:
 
             has_diff = self._compare_worksheet(old_ws, new_ws, result_ws)
             has_dim_diff = self._compare_row_col_dimensions(old_ws, new_ws, result_ws)
+            has_img_diff = self._compare_images(old_ws, new_ws, result_ws, sheet_name)
 
-            # 条件格式仅检测，不修改
-            has_cf_diff = self._detect_conditional_formatting_diff(old_ws, new_ws, sheet_name)
+            # 条件格式仅记录日志，不修改
+            self._detect_conditional_formatting_diff(old_ws, new_ws, sheet_name)
 
-            if has_diff or has_dim_diff or has_cf_diff:
+            if has_diff or has_dim_diff or has_img_diff:
                 self.stats['sheets_with_diff'].add(sheet_name)
 
         # 删除无差异工作表
@@ -66,14 +66,13 @@ class ExcelDiffEngine:
                 del result_wb[name]
                 self.log(f"删除无差异工作表: {name}")
 
-        # 设置注释显示（标准方式）
+        # 设置注释显示
         for ws in result_wb.worksheets:
             if ws.views.sheetView:
                 ws.views.sheetView[0].showComments = True
             else:
                 from openpyxl.worksheet.views import SheetView
-                sv = SheetView(showComments=True)
-                ws.views.sheetView.append(sv)
+                ws.views.sheetView.append(SheetView(showComments=True))
 
         self.progress(95, "生成汇总...")
         self._add_summary(result_wb)
@@ -128,7 +127,6 @@ class ExcelDiffEngine:
                     continue
 
                 if self._is_identical(old_cell, new_cell, old_ws, new_ws):
-                    # 完全相同则清空
                     result_cell.value = None
                     result_cell.font = Font()
                     result_cell.fill = PatternFill()
@@ -379,8 +377,47 @@ class ExcelDiffEngine:
                     self._add_comment(result_ws.cell(row=1, column=col), f"列宽新设置: {nw}")
         return changed
 
+    def _compare_images(self, old_ws, new_ws, result_ws, sheet_name):
+        """比较工作表内的图片（数量、尺寸）"""
+        try:
+            old_images = list(old_ws._images)
+        except AttributeError:
+            old_images = []
+        try:
+            new_images = list(new_ws._images)
+        except AttributeError:
+            new_images = []
+
+        old_count = len(old_images)
+        new_count = len(new_images)
+
+        if old_count == 0 and new_count == 0:
+            return False
+
+        diff_text = []
+        if old_count != new_count:
+            diff_text.append(f"图片数量变更: {old_count} → {new_count}")
+
+        # 比较每个图片的尺寸（宽度、高度）
+        # 注意：图片可能由于锚点不同而无法一一对应，这里简单比较所有图片的尺寸列表
+        old_sizes = sorted([(img.width, img.height) for img in old_images])
+        new_sizes = sorted([(img.width, img.height) for img in new_images])
+
+        if old_sizes != new_sizes:
+            diff_text.append("图片尺寸列表有变更")
+
+        if diff_text:
+            comment = "【图片差异】\n" + "\n".join(diff_text)
+            # 在 A1 单元格添加注释
+            self._add_comment(result_ws.cell(1, 1), comment)
+            result_ws.cell(1, 1).fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
+            self.stats['img_diff_sheets'].append(sheet_name)
+            self.log(f"Sheet '{sheet_name}' 图片有差异: {diff_text}")
+            return True
+        return False
+
     def _detect_conditional_formatting_diff(self, old_ws, new_ws, sheet_name):
-        """仅检测条件格式差异，不修改结果文件的条件格式"""
+        """仅检测条件格式差异，不修改结果文件"""
         old_cfs = list(old_ws.conditional_formatting)
         new_cfs = list(new_ws.conditional_formatting)
 
@@ -399,11 +436,10 @@ class ExcelDiffEngine:
         return False
 
     def _add_comment(self, cell, text):
-        """标准方式添加注释，使用 openpyxl 默认 API，不操作内部对象"""
+        """标准方式添加注释，不操作内部对象"""
         if cell.comment:
-            # 追加内容：重新创建注释以确保尺寸和位置正确
-            old_text = cell.comment.text
-            new_text = old_text + "\n" + text
+            # 重新创建以追加内容并更新尺寸
+            new_text = cell.comment.text + "\n" + text
             comment = Comment(new_text, "ExcelDiff")
         else:
             comment = Comment(text, "ExcelDiff")
@@ -412,7 +448,6 @@ class ExcelDiffEngine:
         lines = comment.text.count("\n") + 1
         comment.width = 350
         comment.height = max(120, lines * 18)
-        # 设置位置
         comment.left = 120000 + (cell.column - 1) * 800000
         comment.top = 50000 + (cell.row - 1) * 400000
         cell.comment = comment
@@ -448,6 +483,7 @@ class ExcelDiffEngine:
             ("差异单元格数", self.stats['diff_cells']),
             ("新增 Sheet", len(self.stats['added_sheets'])),
             ("删除 Sheet", len(self.stats['removed_sheets'])),
+            ("图片差异 Sheet 数", len(self.stats['img_diff_sheets'])),
         ]
         for i, (label, val) in enumerate(stats, 8):
             ws.cell(row=i, column=1, value=label)
@@ -466,6 +502,12 @@ class ExcelDiffEngine:
             for name in self.stats['removed_sheets']:
                 row += 1
                 ws.cell(row=row, column=1, value=name).font = Font(color="CC0000")
+        if self.stats['img_diff_sheets']:
+            row += 2
+            ws.cell(row=row, column=1, value="图片差异 Sheet 列表:").font = Font(color="FF8C00", bold=True)
+            for name in self.stats['img_diff_sheets']:
+                row += 1
+                ws.cell(row=row, column=1, value=name).font = Font(color="FF8C00")
 
         ws.column_dimensions['A'].width = 35
         ws.column_dimensions['B'].width = 18
