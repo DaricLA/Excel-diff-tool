@@ -1,7 +1,7 @@
 """
-Excel 差异对比工具（手动打开文件 - 修复跨线程 COM 错误）
-- 对比引擎在子线程中重新获取 Excel 实例，避免跨线程调用
-- 跳转功能在主线程执行
+Excel 差异对比工具（手动打开文件 - 修复 Address 调用错误）
+- 修复了 win32com 中 Address 属性无法当作方法调用的问题
+- 使用 .Address 属性并手动去除 $ 符号
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -14,6 +14,7 @@ from win32com.client import constants
 
 # ---------------------------- 辅助函数 ----------------------------
 def rgb_to_hex(rgb):
+    """BGR 整数 -> #RRGGBB 字符串"""
     b = (rgb >> 0) & 0xFF
     g = (rgb >> 8) & 0xFF
     r = (rgb >> 16) & 0xFF
@@ -26,7 +27,6 @@ def normalize_path(path):
         return os.path.normpath(path)
 
 def find_workbook(excel_app, target_path):
-    """在给定的 Excel 实例中查找指定路径的工作簿"""
     target = normalize_path(target_path)
     for wb in excel_app.Workbooks:
         try:
@@ -36,7 +36,15 @@ def find_workbook(excel_app, target_path):
             pass
     return None
 
-# ---------------------------- 对比引擎（子线程中独立获取 Excel） ----------------------------
+def cell_address(cell):
+    """获取单元格的相对地址（无$符号），例如 A1"""
+    try:
+        # 获取默认地址（带$），然后替换掉$
+        return cell.Address.replace("$", "")
+    except:
+        return "?"
+
+# ---------------------------- 对比引擎（子线程独立 Excel 实例） ----------------------------
 class ExcelComparer:
     def __init__(self, old_path, new_path, log_callback=None, progress_callback=None):
         self.old_path = old_path
@@ -51,14 +59,11 @@ class ExcelComparer:
         }
 
     def run(self):
-        """在子线程中执行：初始化 COM，获取 Excel 实例，进行对比"""
         pythoncom.CoInitialize()
         excel = None
         try:
-            # 在子线程中获取已运行的 Excel 实例
             excel = win32com.client.GetObject(Class="Excel.Application")
             self.log("子线程已连接到 Excel")
-            # 输出当前打开的文件
             wb_paths = []
             for wb in excel.Workbooks:
                 try:
@@ -69,11 +74,8 @@ class ExcelComparer:
 
             old_wb = find_workbook(excel, self.old_path)
             new_wb = find_workbook(excel, self.new_path)
-
-            if not old_wb:
-                raise Exception(f"未找到旧版文件: {self.old_path}")
-            if not new_wb:
-                raise Exception(f"未找到新版文件: {self.new_path}")
+            if not old_wb or not new_wb:
+                raise Exception("未找到指定的文件，请确保两个文件已在 Excel 中打开")
 
             self.log("开始对比数据...")
             self.progress(5, "读取数据中...")
@@ -96,7 +98,6 @@ class ExcelComparer:
         finally:
             pythoncom.CoUninitialize()
 
-    # ---------- 比较方法（与之前完全相同）----------
     def _compare_sheets(self, old_wb, new_wb):
         old_names = {s.Name for s in old_wb.Worksheets}
         new_names = {s.Name for s in new_wb.Worksheets}
@@ -121,7 +122,7 @@ class ExcelComparer:
             for c in range(1, max_col+1):
                 old_cell = old_ws.Cells(r, c) if r <= old_max_row and c <= old_max_col else None
                 new_cell = new_ws.Cells(r, c) if r <= new_max_row and c <= new_max_col else None
-                addr = old_cell.Address(False, False) if old_cell else new_cell.Address(False, False)
+                addr = cell_address(old_cell) if old_cell else cell_address(new_cell)
                 self.stats['total_cells'] += 1
                 diff = self._get_cell_diff(old_cell, new_cell)
                 if diff:
@@ -214,7 +215,7 @@ class ExcelComparer:
                 ow = old_cols(c).ColumnWidth
                 nw = new_cols(c).ColumnWidth if c <= new_ws.UsedRange.Columns.Count else None
                 if ow != nw:
-                    col_letter = old_ws.Cells(1, c).Address(False, False).replace("1","").replace("$","")
+                    col_letter = cell_address(old_ws.Cells(1, c)).replace("1", "")
                     self.diffs.append({'sheet':sheet_name,'address':f"{col_letter}1",'type':'列宽变化','desc':f'列宽: {ow} → {nw}'})
         except: pass
 
@@ -223,9 +224,13 @@ class ExcelComparer:
             old_shapes = old_ws.Shapes; new_shapes = new_ws.Shapes
             old_imgs = []; new_imgs = []
             for s in old_shapes:
-                if s.Type == 13: old_imgs.append((s.TopLeftCell.Address(False,False), s.Width, s.Height))
+                if s.Type == 13:
+                    top_left = cell_address(s.TopLeftCell)
+                    old_imgs.append((top_left, s.Width, s.Height))
             for s in new_shapes:
-                if s.Type == 13: new_imgs.append((s.TopLeftCell.Address(False,False), s.Width, s.Height))
+                if s.Type == 13:
+                    top_left = cell_address(s.TopLeftCell)
+                    new_imgs.append((top_left, s.Width, s.Height))
             if old_imgs != new_imgs:
                 self.stats['images_diff'] += 1
                 anchor = old_imgs[0][0] if old_imgs else (new_imgs[0][0] if new_imgs else 'A1')
@@ -240,14 +245,13 @@ class ExcelComparer:
                 self.diffs.append({'sheet':sheet_name,'address':'A1','type':'条件格式数量变化','desc':f'条件格式数量: {oc} → {nc}'})
         except: pass
 
-# ---------------------------- GUI ----------------------------
+# ---------------------------- GUI（主线程） ----------------------------
 class DiffViewer:
     def __init__(self, root):
         self.root = root
         self.root.title("Excel 差异对比工具（手动打开文件）")
         self.root.geometry("950x650")
-        self.excel_app = None   # 主线程用于跳转的 Excel 实例
-        self.old_wb = self.new_wb = None
+        self.excel_app = None
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
 
@@ -374,7 +378,6 @@ class DiffViewer:
             elif sd.get('old_name'): self._navigate(sd['old_name'], 'A1')
 
     def _ensure_excel_app(self):
-        """在主线程中获取 Excel 实例（用于跳转）"""
         if self.excel_app is None:
             try:
                 self.excel_app = win32com.client.GetObject(Class="Excel.Application")
