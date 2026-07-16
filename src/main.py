@@ -1,8 +1,8 @@
 """
-Excel 差异对比工具（终极防弹窗版）
-- 打开 Excel 时彻底禁止宏、更新链接、激活弹窗
-- 对比在后台线程完成，不干扰主界面
-- 双击跳转至新旧文件对应单元格（主线程执行）
+Excel 差异对比工具（手动打开文件版）
+- 用户手动打开新旧两个 Excel 文件后，点击“开始对比”
+- 工具通过 GetObject 获取已运行的 Excel 实例进行读取和跳转
+- 完全避免启动 Excel 时可能出现的激活弹窗
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -13,7 +13,7 @@ import pythoncom
 import win32com.client
 from win32com.client import constants
 
-# ---------------------------- 辅助 ----------------------------
+# ---------------------------- 辅助函数 ----------------------------
 def rgb_to_hex(rgb):
     """BGR 整数 -> #RRGGBB 字符串"""
     b = (rgb >> 0) & 0xFF
@@ -21,11 +21,22 @@ def rgb_to_hex(rgb):
     r = (rgb >> 16) & 0xFF
     return f"#{r:02X}{g:02X}{b:02X}"
 
-# ---------------------------- 对比引擎（后台线程） ----------------------------
+def find_workbook(excel_app, path):
+    """在已运行的 Excel 应用中查找指定路径的工作簿"""
+    try:
+        for wb in excel_app.Workbooks:
+            if os.path.normcase(wb.FullName) == os.path.normcase(path):
+                return wb
+    except:
+        pass
+    return None
+
+# ---------------------------- 对比引擎（基于已打开的 Excel） ----------------------------
 class ExcelComparer:
-    def __init__(self, old_path, new_path, log_callback=None, progress_callback=None):
+    def __init__(self, old_path, new_path, excel_app, log_callback=None, progress_callback=None):
         self.old_path = old_path
         self.new_path = new_path
+        self.excel_app = excel_app   # 已存在的 Excel 实例
         self.log = log_callback if log_callback else print
         self.progress = progress_callback if progress_callback else lambda v,s: None
         self.diffs = []
@@ -36,33 +47,18 @@ class ExcelComparer:
         }
 
     def run(self):
-        """在子线程中完成对比，结束后关闭 Excel"""
+        """基于已打开的 Excel 实例执行对比"""
         pythoncom.CoInitialize()
-        excel = None
-        old_wb = None
-        new_wb = None
         try:
-            # 创建新的 Excel 实例，完全隐藏
-            excel = win32com.client.DispatchEx("Excel.Application")
-            excel.Visible = False          # 不可见
-            excel.DisplayAlerts = False    # 不弹警告
-            excel.AskToUpdateLinks = False # 不询问链接更新
-            excel.AutomationSecurity = 1   # 禁用所有宏
+            # 从已存在的 Excel 应用中获取两个工作簿
+            old_wb = find_workbook(self.excel_app, self.old_path)
+            new_wb = find_workbook(self.excel_app, self.new_path)
 
-            self.progress(5, "打开文件（安全模式）...")
-            # 打开工作簿，禁用链接更新，并跳过可能损坏的警告
-            old_wb = excel.Workbooks.Open(
-                self.old_path,
-                ReadOnly=True,
-                UpdateLinks=0,            # 不更新链接
-                CorruptLoad=1             # 正常加载（避免损坏提示）
-            )
-            new_wb = excel.Workbooks.Open(
-                self.new_path,
-                ReadOnly=True,
-                UpdateLinks=0,
-                CorruptLoad=1
-            )
+            if not old_wb or not new_wb:
+                raise Exception("无法在已打开的 Excel 中找到指定的文件，请确认两个文件都已打开。")
+
+            self.log("正在从已打开的 Excel 读取数据...")
+            self.progress(5, "读取数据中...")
 
             self._compare_sheets(old_wb, new_wb)
             old_sheets = {s.Name: s for s in old_wb.Worksheets}
@@ -81,18 +77,9 @@ class ExcelComparer:
             self.log(f"对比失败: {e}")
             raise
         finally:
-            try:
-                if old_wb: old_wb.Close(SaveChanges=False)
-                if new_wb: new_wb.Close(SaveChanges=False)
-                if excel:
-                    excel.ScreenUpdating = True
-                    excel.DisplayAlerts = True
-                    excel.Quit()
-            except:
-                pass
             pythoncom.CoUninitialize()
 
-    # ---------- 以下比较方法保持不变 ----------
+    # ---------- 以下比较方法与之前完全相同 ----------
     def _compare_sheets(self, old_wb, new_wb):
         old_names = {s.Name for s in old_wb.Worksheets}
         new_names = {s.Name for s in new_wb.Worksheets}
@@ -237,13 +224,13 @@ class ExcelComparer:
                 self.diffs.append({'sheet':sheet_name,'address':'A1','type':'条件格式数量变化','desc':f'条件格式数量: {oc} → {nc}'})
         except: pass
 
-# ---------------------------- GUI（主线程） ----------------------------
+# ---------------------------- GUI ----------------------------
 class DiffViewer:
     def __init__(self, root):
         self.root = root
-        self.root.title("Excel 差异对比工具")
+        self.root.title("Excel 差异对比工具（手动打开文件）")
         self.root.geometry("950x650")
-        self.excel_app = None
+        self.excel_app = None   # 已运行的 Excel 实例
         self.old_wb = self.new_wb = None
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
@@ -257,8 +244,13 @@ class DiffViewer:
         ttk.Entry(top, textvariable=self.new_path, width=60).grid(row=1,column=1,padx=5)
         ttk.Button(top, text="浏览", command=lambda: self.browse(self.new_path)).grid(row=1,column=2)
 
+        # 提示信息
+        hint = ttk.Label(top, text="请先手动用 Excel 打开以上两个文件，然后点击“开始对比”",
+                         foreground="blue")
+        hint.grid(row=2, column=0, columnspan=3, pady=(5,0))
+
         btn_frame = ttk.Frame(top)
-        btn_frame.grid(row=2,column=0,columnspan=3,pady=5)
+        btn_frame.grid(row=3,column=0,columnspan=3,pady=5)
         self.start_btn = ttk.Button(btn_frame, text="开始对比", command=self.start_compare)
         self.start_btn.pack(side='left',padx=5)
         self.jump_btn = ttk.Button(btn_frame, text="跳转到选中项", command=self.jump_to_selected, state='disabled')
@@ -309,6 +301,22 @@ class DiffViewer:
         old = self.old_path.get(); new = self.new_path.get()
         if not old or not new:
             messagebox.showerror("错误","请选择两个文件"); return
+
+        # 尝试获取已运行的 Excel 实例
+        try:
+            self.excel_app = win32com.client.GetObject(Class="Excel.Application")
+        except:
+            messagebox.showerror("错误", "没有检测到正在运行的 Excel。\n请手动打开新旧两个 Excel 文件后再试。")
+            return
+
+        # 检查文件是否已打开
+        if not find_workbook(self.excel_app, old):
+            messagebox.showerror("错误", f"旧版文件未在 Excel 中打开:\n{old}\n请手动打开后重试。")
+            return
+        if not find_workbook(self.excel_app, new):
+            messagebox.showerror("错误", f"新版文件未在 Excel 中打开:\n{new}\n请手动打开后重试。")
+            return
+
         self.start_btn.configure(state='disabled')
         self.tree.delete(*self.tree.get_children())
         self.detail.delete('1.0','end')
@@ -316,12 +324,12 @@ class DiffViewer:
 
         def worker():
             try:
-                comparer = ExcelComparer(old, new, self.log, self.update_progress)
+                comparer = ExcelComparer(old, new, self.excel_app, self.log, self.update_progress)
                 comparer.run()
                 self.result_data = (comparer.diffs, comparer.sheet_diffs, comparer.stats)
                 self.root.after(0, self.populate_tree)
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
+                self.root.after(0, lambda: messagebox.showerror("对比失败", str(e)))
             finally:
                 self.root.after(0, lambda: self.start_btn.configure(state='normal'))
 
@@ -368,20 +376,16 @@ class DiffViewer:
             elif sd.get('old_name'): self._navigate(sd['old_name'], 'A1')
 
     def _navigate(self, sheet_name, address):
-        """在主线程创建 Excel 实例并跳转"""
+        """在已打开的 Excel 中选中单元格"""
         try:
             if not self.excel_app:
-                self.excel_app = win32com.client.DispatchEx("Excel.Application")
-                self.excel_app.Visible = True
-                self.excel_app.DisplayAlerts = False
-                self.excel_app.AskToUpdateLinks = False
-                self.excel_app.AutomationSecurity = 1
-                # 打开两个文件（只读）
-                self.old_wb = self.excel_app.Workbooks.Open(self.old_path.get(), ReadOnly=True, UpdateLinks=0, CorruptLoad=1)
-                self.new_wb = self.excel_app.Workbooks.Open(self.new_path.get(), ReadOnly=True, UpdateLinks=0, CorruptLoad=1)
-                self.excel_app.Windows.Arrange(constants.xlArrangeStyleTiled)
-
-            for wb, desc in [(self.old_wb, "旧版"), (self.new_wb, "新版")]:
+                return
+            old_wb = find_workbook(self.excel_app, self.old_path.get())
+            new_wb = find_workbook(self.excel_app, self.new_path.get())
+            for wb, desc in [(old_wb, "旧版"), (new_wb, "新版")]:
+                if wb is None:
+                    self.log(f"{desc} 文件未打开，无法跳转")
+                    continue
                 try:
                     ws = wb.Worksheets(sheet_name)
                     ws.Activate()
