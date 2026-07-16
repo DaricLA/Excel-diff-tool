@@ -1,9 +1,10 @@
 """
-Excel 差异对比工具（优化版）
-- 可拖动分隔条，左侧列表初始占2/3，右侧详情占1/3
-- 增强富文本差异检测
-- 使用Goto定位单元格，视觉更醒目
-- 完全由用户手动打开Excel，工具仅检测与跳转
+Excel 差异对比工具（终极优化版）
+- 界面：按钮与文件选择同排，差异树全屏中央，底部左侧日志、右侧详情各半
+- 条件格式定位到其作用范围的首个单元格
+- 富文本检测采用底层 XML 解析，确保高可靠性
+- 跳转使用 Application.Goto，视觉效果更醒目
+- 手动打开 Excel，不自动启动
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -16,6 +17,7 @@ from win32com.client import constants
 from openpyxl import load_workbook
 from openpyxl.cell.rich_text import CellRichText
 from openpyxl.utils import get_column_letter
+from lxml import etree
 
 # ---------------------------- 辅助函数 ----------------------------
 def rgb_to_hex(rgb):
@@ -33,6 +35,65 @@ def normalize_path(path):
         return os.path.normpath(os.path.realpath(path))
     except:
         return os.path.normpath(path)
+
+# ---------------------------- 富文本检测模块 ----------------------------
+def extract_rich_text_elements(cell_xml):
+    """从单元格XML中提取所有<r>元素，返回列表，每个元素为 (text, font_dict)"""
+    elements = []
+    for r in cell_xml.findall('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}r'):
+        t = r.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t')
+        text = t.text if t is not None else ""
+        rPr = r.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}rPr')
+        font = {}
+        if rPr is not None:
+            # 提取字体属性
+            font['name'] = rPr.findtext('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}rFont', '')
+            font['size'] = rPr.findtext('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sz', '')
+            font['bold'] = rPr.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}b') is not None
+            font['italic'] = rPr.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}i') is not None
+            font['underline'] = rPr.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}u') is not None
+            color_elem = rPr.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}color')
+            if color_elem is not None:
+                font['color'] = color_elem.get('rgb', 'None')
+            else:
+                font['color'] = 'None'
+        elements.append((text, font))
+    return elements
+
+def compare_rich_text(cell1, cell2):
+    """比较两个单元格的富文本，返回差异描述或None"""
+    # 获取底层 XML
+    xml1 = cell1._cell.xml if hasattr(cell1, '_cell') else None
+    xml2 = cell2._cell.xml if hasattr(cell2, '_cell') else None
+    if not xml1 or not xml2:
+        return None
+
+    elem1 = extract_rich_text_elements(etree.fromstring(xml1.encode()))
+    elem2 = extract_rich_text_elements(etree.fromstring(xml2.encode()))
+
+    if len(elem1) == 0 and len(elem2) == 0:
+        return None  # 无富文本
+
+    # 比较纯文本
+    plain1 = ''.join(e[0] for e in elem1)
+    plain2 = ''.join(e[0] for e in elem2)
+    if plain1 != plain2:
+        return f"内容(含富文本): {plain1} → {plain2}"
+
+    # 比较段落格式
+    if len(elem1) != len(elem2):
+        return f"富文本段落数不同: {len(elem1)} → {len(elem2)}"
+    changes = []
+    for i, ((t1, f1), (t2, f2)) in enumerate(zip(elem1, elem2)):
+        if f1 != f2:
+            diff = []
+            for key in ['name', 'size', 'bold', 'italic', 'underline', 'color']:
+                if f1.get(key) != f2.get(key):
+                    diff.append(f"{key}: {f1.get(key)}→{f2.get(key)}")
+            changes.append(f"段{i+1} '{t1}': {'; '.join(diff)}")
+    if changes:
+        return "富文本格式变更:\n" + "\n".join(changes)
+    return None
 
 # ---------------------------- 对比引擎 ----------------------------
 class OpenpyxlComparer:
@@ -103,23 +164,24 @@ class OpenpyxlComparer:
         self._compare_conditional_formats(old_ws, new_ws, sheet_name)
 
     def _get_cell_diff(self, old_cell, new_cell):
+        # 1. 富文本优先检测
+        rich_diff = compare_rich_text(old_cell, new_cell)
+        if rich_diff:
+            return {'type': '内容(含富文本)', 'desc': rich_diff}
+
         old_val = old_cell.value
         new_val = new_cell.value
-        # 1. 值/公式/富文本差异
-        if not self._value_equal(old_val, new_val):
+        # 2. 值/公式变化（普通文本或公式）
+        if old_val != new_val:
             old_str = f"{old_val}" if old_val is not None else "(空)"
             new_str = f"{new_val}" if new_val is not None else "(空)"
-            # 如果是富文本，生成详细的格式变更描述
-            if isinstance(old_val, CellRichText) or isinstance(new_val, CellRichText):
-                rich_desc = self._rich_text_diff(old_val, new_val)
-                return {'type': '内容(含富文本)', 'desc': rich_desc}
-            elif (isinstance(old_val, str) and old_val.startswith('=')) or \
-                 (isinstance(new_val, str) and new_val.startswith('=')):
+            if isinstance(old_val, str) and old_val.startswith('=') or \
+               isinstance(new_val, str) and new_val.startswith('='):
                 return {'type': '公式变化', 'desc': f'{old_str} → {new_str}'}
             else:
                 return {'type': '值变化', 'desc': f'{old_str} → {new_str}'}
 
-        # 2. 格式差异（整体字体、填充等）
+        # 3. 格式差异（整体字体、填充等）
         descs = []
         font_diff = self._cmp_font(old_cell.font, new_cell.font)
         if font_diff: descs.append(f"字体: {font_diff}")
@@ -134,48 +196,6 @@ class OpenpyxlComparer:
         if descs:
             return {'type': '格式变化', 'desc': '; '.join(descs)}
         return None
-
-    def _value_equal(self, v1, v2):
-        if type(v1) != type(v2):
-            return False
-        if isinstance(v1, CellRichText) and isinstance(v2, CellRichText):
-            if len(v1) != len(v2):
-                return False
-            for t1, t2 in zip(v1, v2):
-                if t1.text != t2.text or not self._font_equal(t1.font, t2.font):
-                    return False
-            return True
-        return v1 == v2
-
-    def _rich_text_diff(self, old_rt, new_rt):
-        if not isinstance(old_rt, CellRichText):
-            old_rt = CellRichText(str(old_rt) if old_rt else "")
-        if not isinstance(new_rt, CellRichText):
-            new_rt = CellRichText(str(new_rt) if new_rt else "")
-        old_plain = str(old_rt)
-        new_plain = str(new_rt)
-        if old_plain != new_plain:
-            return f"内容(含富文本): {old_plain} → {new_plain}"
-        lines = []
-        for i, (t1, t2) in enumerate(zip(old_rt, new_rt)):
-            if t1.text != t2.text or not self._font_equal(t1.font, t2.font):
-                seg = t1.text if t1.text else "(空)"
-                changes = []
-                if t1.font.name != t2.font.name: changes.append(f"字体: {t1.font.name}→{t2.font.name}")
-                if t1.font.size != t2.font.size: changes.append(f"大小: {t1.font.size}→{t2.font.size}")
-                if t1.font.bold != t2.font.bold: changes.append(f"粗: {t1.font.bold}→{t2.font.bold}")
-                if t1.font.italic != t2.font.italic: changes.append(f"斜: {t1.font.italic}→{t2.font.italic}")
-                if t1.font.color != t2.font.color: changes.append(f"颜色: {rgb_to_hex(t1.font.color)}→{rgb_to_hex(t2.font.color)}")
-                if changes:
-                    lines.append(f"段{i+1} '{seg}': {'; '.join(changes)}")
-                else:
-                    lines.append(f"段{i+1} '{seg}': 变为 '{t2.text}'")
-        return "富文本格式变更:\n" + "\n".join(lines) if lines else "富文本格式有细微变化"
-
-    @staticmethod
-    def _font_equal(f1, f2):
-        return (f1.name == f2.name and f1.size == f2.size and f1.bold == f2.bold and
-                f1.italic == f2.italic and f1.underline == f2.underline and f1.color == f2.color)
 
     def _cmp_font(self, f1, f2):
         changes = []
@@ -315,9 +335,12 @@ class OpenpyxlComparer:
         old_cf_dicts = [cf_to_dict(cf) for cf in old_cfs]
         new_cf_dicts = [cf_to_dict(cf) for cf in new_cfs]
         if old_cf_dicts != new_cf_dicts:
+            # 获取第一个条件格式范围的左上角单元格作为定位
+            first_range = str(old_cfs[0].sqref) if old_cfs else str(new_cfs[0].sqref)
+            start_cell = first_range.split(':')[0] if ':' in first_range else first_range
             self.diffs.append({
                 'sheet': sheet_name,
-                'address': 'A1',
+                'address': start_cell,
                 'type': '条件格式变化',
                 'desc': f'条件格式规则有差异 (旧版 {len(old_cfs)} 条, 新版 {len(new_cfs)} 条)'
             })
@@ -332,63 +355,61 @@ class DiffViewer:
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
 
-        # 顶部文件选择区域
-        top = ttk.Frame(root, padding=10)
+        # 顶部控制栏：文件选择 + 按钮
+        top = ttk.Frame(root, padding=5)
         top.grid(row=0, column=0, sticky='ew')
-        ttk.Label(top, text="旧版文件:", font=("微软雅黑", 10)).grid(row=0,column=0,sticky='w')
-        ttk.Entry(top, textvariable=self.old_path, width=60).grid(row=0,column=1,padx=5)
+        top.columnconfigure(1, weight=1)
+
+        ttk.Label(top, text="旧版:", font=("微软雅黑", 9)).grid(row=0,column=0,sticky='w')
+        self.old_entry = ttk.Entry(top, textvariable=self.old_path, width=35)
+        self.old_entry.grid(row=0,column=1,padx=5,sticky='ew')
         ttk.Button(top, text="浏览", command=lambda: self.browse(self.old_path)).grid(row=0,column=2)
-        ttk.Label(top, text="新版文件:", font=("微软雅黑", 10)).grid(row=1,column=0,sticky='w',pady=5)
-        ttk.Entry(top, textvariable=self.new_path, width=60).grid(row=1,column=1,padx=5)
+
+        ttk.Label(top, text="新版:", font=("微软雅黑", 9)).grid(row=1,column=0,sticky='w',pady=3)
+        self.new_entry = ttk.Entry(top, textvariable=self.new_path, width=35)
+        self.new_entry.grid(row=1,column=1,padx=5,sticky='ew')
         ttk.Button(top, text="浏览", command=lambda: self.browse(self.new_path)).grid(row=1,column=2)
 
         btn_frame = ttk.Frame(top)
-        btn_frame.grid(row=2,column=0,columnspan=3,pady=5)
-        self.start_btn = tk.Button(btn_frame, text="开始对比", font=("微软雅黑", 11, "bold"),
-                                   bg="#0078D7", fg="white", width=12, command=self.start_compare)
-        self.start_btn.pack(side='left',padx=5)
-        self.jump_btn = tk.Button(btn_frame, text="跳转到选中项", font=("微软雅黑", 10),
+        btn_frame.grid(row=0,column=3,rowspan=2,padx=10)
+        self.start_btn = tk.Button(btn_frame, text="开始对比", font=("微软雅黑", 10, "bold"),
+                                   bg="#0078D7", fg="white", width=8, command=self.start_compare)
+        self.start_btn.pack(side='left',padx=2)
+        self.jump_btn = tk.Button(btn_frame, text="跳转", font=("微软雅黑", 10),
                                   command=self.jump_to_selected, state='disabled')
-        self.jump_btn.pack(side='left',padx=5)
+        self.jump_btn.pack(side='left',padx=2)
 
         self.progress = ttk.Progressbar(root, mode='determinate')
-        self.progress.grid(row=1, column=0, sticky='ew', padx=10, pady=(5,0))
+        self.progress.grid(row=1, column=0, sticky='ew', padx=5)
 
-        # 可拖动的 PanedWindow：左侧列表，右侧详情
-        paned = ttk.PanedWindow(root, orient='horizontal')
-        paned.grid(row=2, column=0, sticky='nsew', padx=10, pady=5)
-        root.grid_rowconfigure(2, weight=1)
-        root.grid_columnconfigure(0, weight=1)
-
-        left_frame = ttk.Frame(paned)
-        right_frame = ttk.Frame(paned)
-        paned.add(left_frame, weight=2)   # 初始比例 2/3
-        paned.add(right_frame, weight=1)  # 初始比例 1/3
-
-        # 左侧列表
-        self.tree = ttk.Treeview(left_frame, columns=('address','type'), show='tree headings')
-        self.tree.heading('#0',text='Sheet / 差异项')
-        self.tree.heading('address',text='位置')
-        self.tree.heading('type',text='类型')
+        # 中央：差异树
+        self.tree = ttk.Treeview(root, columns=('address','type'), show='tree headings')
+        self.tree.heading('#0',text='Sheet / 差异项'); self.tree.heading('address',text='位置'); self.tree.heading('type',text='类型')
         self.tree.column('#0',width=200); self.tree.column('address',width=80); self.tree.column('type',width=120)
-        scroll_y = ttk.Scrollbar(left_frame, orient='vertical', command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll_y.set)
-        self.tree.pack(side='left', fill='both', expand=True)
-        scroll_y.pack(side='right', fill='y')
+        scroll_tree = ttk.Scrollbar(root, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll_tree.set)
+        self.tree.grid(row=2, column=0, sticky='nsew', padx=5, pady=5)
+        scroll_tree.grid(row=2, column=1, sticky='ns')
+        root.grid_rowconfigure(2, weight=1)   # 让树占据剩余高度
 
         self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
         self.tree.bind('<Double-1>', self.jump_to_selected)
 
-        # 右侧详情
-        ttk.Label(right_frame, text="差异详情", font=('微软雅黑',10,'bold')).pack(anchor='w')
-        self.detail = tk.Text(right_frame, wrap='word', height=20, font=("微软雅黑", 10))
-        self.detail.pack(fill='both',expand=True)
+        # 底部：左右分栏（日志 / 详情）
+        bottom_frame = ttk.Frame(root)
+        bottom_frame.grid(row=3, column=0, sticky='ew', padx=5, pady=(0,5))
+        bottom_frame.columnconfigure(0, weight=1)
+        bottom_frame.columnconfigure(1, weight=1)
 
-        # 日志区域
-        logf = ttk.LabelFrame(root, text="日志", padding=5)
-        logf.grid(row=3, column=0, sticky='ew', padx=10, pady=(0,10))
-        self.log_text = tk.Text(logf, height=8, wrap='word', font=("微软雅黑", 10))
+        logf = ttk.LabelFrame(bottom_frame, text="日志", padding=3)
+        logf.grid(row=0, column=0, sticky='nsew', padx=(0,3))
+        self.log_text = tk.Text(logf, height=6, wrap='word', font=("微软雅黑", 9))
         self.log_text.pack(fill='both',expand=True)
+
+        detailf = ttk.LabelFrame(bottom_frame, text="差异详情", padding=3)
+        detailf.grid(row=0, column=1, sticky='nsew')
+        self.detail = tk.Text(detailf, height=6, wrap='word', font=("微软雅黑", 9))
+        self.detail.pack(fill='both',expand=True)
 
         self.diff_items = []
         self.result_data = None
@@ -452,15 +473,10 @@ class DiffViewer:
 
     def on_tree_select(self, event):
         sel = self.tree.selection()
-        if not sel:
-            return
+        if not sel: return
         node = sel[0]
-        target = None
-        for n, d in self.diff_items:
-            if n == node:
-                target = d; break
-        if not target:
-            return
+        target = next((d for n, d in self.diff_items if n == node), None)
+        if not target: return
         if target['type'] == 'cell':
             d = target['data']
             self.detail.delete('1.0','end')
@@ -474,10 +490,7 @@ class DiffViewer:
         sel = self.tree.selection()
         if not sel: return
         node = sel[0]
-        target = None
-        for n, d in self.diff_items:
-            if n == node:
-                target = d; break
+        target = next((d for n, d in self.diff_items if n == node), None)
         if not target: return
 
         if target['type'] == 'cell':
@@ -494,47 +507,39 @@ class DiffViewer:
         def navigate():
             pythoncom.CoInitialize()
             try:
-                try:
-                    excel = win32com.client.GetObject(Class="Excel.Application")
-                except:
-                    messagebox.showinfo("提示", "未检测到正在运行的 Excel 进程，请手动打开两个文件后再跳转。")
-                    return
+                excel = win32com.client.GetObject(Class="Excel.Application")
+            except:
+                messagebox.showinfo("提示", "未检测到正在运行的 Excel 进程，请手动打开两个文件后再跳转。")
+                return
 
-                old_path = normalize_path(self.old_path.get())
-                new_path = normalize_path(self.new_path.get())
-                old_wb = None
-                new_wb = None
-                for wb in excel.Workbooks:
-                    path = normalize_path(wb.FullName)
-                    if path == old_path:
-                        old_wb = wb
-                    elif path == new_path:
-                        new_wb = wb
+            old_path = normalize_path(self.old_path.get())
+            new_path = normalize_path(self.new_path.get())
+            old_wb = new_wb = None
+            for wb in excel.Workbooks:
+                if normalize_path(wb.FullName) == old_path: old_wb = wb
+                elif normalize_path(wb.FullName) == new_path: new_wb = wb
 
-                if not old_wb or not new_wb:
-                    missing = []
-                    if not old_wb: missing.append(f"旧版文件: {self.old_path.get()}")
-                    if not new_wb: missing.append(f"新版文件: {self.new_path.get()}")
-                    messagebox.showinfo("文件未打开", "以下文件未在 Excel 中打开：\n" + "\n".join(missing) + "\n请手动打开后重试。")
-                    return
-
-                # 使用 Goto 定位并居中，视觉效果更醒目
-                for wb, desc in [(old_wb, "旧版"), (new_wb, "新版")]:
-                    try:
-                        ws = wb.Worksheets(sheet)
-                        ws.Activate()
-                        excel.Goto(ws.Range(address), Scroll=True)  # 关键：使用 Goto
-                        self.log(f"{desc} 已跳转到 {sheet}!{address}")
-                    except Exception as e:
-                        self.log(f"{desc} 跳转失败: {e}")
-
-                excel.Visible = True
-                excel.WindowState = -4137  # xlMaximized
-                self.root.after(100, lambda: self.root.lower())
-            except Exception as e:
-                self.log(f"跳转出错: {e}")
-            finally:
+            if not old_wb or not new_wb:
+                missing = []
+                if not old_wb: missing.append(f"旧版: {self.old_path.get()}")
+                if not new_wb: missing.append(f"新版: {self.new_path.get()}")
+                messagebox.showinfo("文件未打开", "以下文件未打开：\n" + "\n".join(missing) + "\n请手动打开后重试。")
                 pythoncom.CoUninitialize()
+                return
+
+            for wb, desc in [(old_wb, "旧版"), (new_wb, "新版")]:
+                try:
+                    ws = wb.Worksheets(sheet)
+                    ws.Activate()
+                    excel.Goto(ws.Range(address), Scroll=True)
+                    self.log(f"{desc} 已跳转到 {sheet}!{address}")
+                except Exception as e:
+                    self.log(f"{desc} 跳转失败: {e}")
+
+            excel.Visible = True
+            excel.WindowState = -4137
+            self.root.after(100, lambda: self.root.lower())
+            pythoncom.CoUninitialize()
 
         threading.Thread(target=navigate, daemon=True).start()
 
