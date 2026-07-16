@@ -1,8 +1,8 @@
 """
-Excel 差异对比工具（手动打开文件版）
+Excel 差异对比工具（手动打开文件版 - 修复文件匹配）
 - 用户手动打开新旧两个 Excel 文件后，点击“开始对比”
 - 工具通过 GetObject 获取已运行的 Excel 实例进行读取和跳转
-- 完全避免启动 Excel 时可能出现的激活弹窗
+- 路径比较采用标准化处理，避免大小写、斜杠差异
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -21,22 +21,37 @@ def rgb_to_hex(rgb):
     r = (rgb >> 16) & 0xFF
     return f"#{r:02X}{g:02X}{b:02X}"
 
-def find_workbook(excel_app, path):
-    """在已运行的 Excel 应用中查找指定路径的工作簿"""
+def normalize_path(path):
+    """标准化路径用于比较"""
     try:
-        for wb in excel_app.Workbooks:
-            if os.path.normcase(wb.FullName) == os.path.normcase(path):
-                return wb
+        return os.path.normpath(os.path.realpath(path))
     except:
-        pass
+        return os.path.normpath(path)
+
+def find_workbook(excel_app, target_path):
+    """在已运行的 Excel 应用中查找指定路径的工作簿"""
+    target = normalize_path(target_path)
+    # 调试：输出当前 Excel 中所有打开的工作簿路径
+    opened = []
+    for wb in excel_app.Workbooks:
+        try:
+            wb_path = normalize_path(wb.FullName)
+            opened.append(wb_path)
+            if wb_path == target:
+                return wb
+        except:
+            pass
+    # 如果没找到，输出可用的路径供排查
+    print(f"目标文件: {target}")
+    print(f"Excel 中打开的文件: {opened}")
     return None
 
-# ---------------------------- 对比引擎（基于已打开的 Excel） ----------------------------
+# ---------------------------- 对比引擎 ----------------------------
 class ExcelComparer:
     def __init__(self, old_path, new_path, excel_app, log_callback=None, progress_callback=None):
         self.old_path = old_path
         self.new_path = new_path
-        self.excel_app = excel_app   # 已存在的 Excel 实例
+        self.excel_app = excel_app
         self.log = log_callback if log_callback else print
         self.progress = progress_callback if progress_callback else lambda v,s: None
         self.diffs = []
@@ -47,17 +62,27 @@ class ExcelComparer:
         }
 
     def run(self):
-        """基于已打开的 Excel 实例执行对比"""
         pythoncom.CoInitialize()
         try:
-            # 从已存在的 Excel 应用中获取两个工作簿
+            self.log("正在连接到已打开的 Excel...")
+            # 输出当前打开的所有工作簿路径到日志
+            wbs_info = []
+            for wb in self.excel_app.Workbooks:
+                try:
+                    wbs_info.append(wb.FullName)
+                except:
+                    wbs_info.append("?")
+            self.log(f"Excel 中当前打开的文件: {wbs_info}")
+
             old_wb = find_workbook(self.excel_app, self.old_path)
             new_wb = find_workbook(self.excel_app, self.new_path)
 
-            if not old_wb or not new_wb:
-                raise Exception("无法在已打开的 Excel 中找到指定的文件，请确认两个文件都已打开。")
+            if not old_wb:
+                raise Exception(f"未找到旧版文件: {self.old_path}\n请确保已在 Excel 中打开。")
+            if not new_wb:
+                raise Exception(f"未找到新版文件: {self.new_path}\n请确保已在 Excel 中打开。")
 
-            self.log("正在从已打开的 Excel 读取数据...")
+            self.log("正在读取数据...")
             self.progress(5, "读取数据中...")
 
             self._compare_sheets(old_wb, new_wb)
@@ -79,7 +104,7 @@ class ExcelComparer:
         finally:
             pythoncom.CoUninitialize()
 
-    # ---------- 以下比较方法与之前完全相同 ----------
+    # ---------- 以下比较方法保持不变 ----------
     def _compare_sheets(self, old_wb, new_wb):
         old_names = {s.Name for s in old_wb.Worksheets}
         new_names = {s.Name for s in new_wb.Worksheets}
@@ -230,7 +255,7 @@ class DiffViewer:
         self.root = root
         self.root.title("Excel 差异对比工具（手动打开文件）")
         self.root.geometry("950x650")
-        self.excel_app = None   # 已运行的 Excel 实例
+        self.excel_app = None
         self.old_wb = self.new_wb = None
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
@@ -244,9 +269,7 @@ class DiffViewer:
         ttk.Entry(top, textvariable=self.new_path, width=60).grid(row=1,column=1,padx=5)
         ttk.Button(top, text="浏览", command=lambda: self.browse(self.new_path)).grid(row=1,column=2)
 
-        # 提示信息
-        hint = ttk.Label(top, text="请先手动用 Excel 打开以上两个文件，然后点击“开始对比”",
-                         foreground="blue")
+        hint = ttk.Label(top, text="请先用 Excel 打开以上两个文件，然后点击“开始对比”", foreground="blue")
         hint.grid(row=2, column=0, columnspan=3, pady=(5,0))
 
         btn_frame = ttk.Frame(top)
@@ -302,14 +325,19 @@ class DiffViewer:
         if not old or not new:
             messagebox.showerror("错误","请选择两个文件"); return
 
-        # 尝试获取已运行的 Excel 实例
         try:
             self.excel_app = win32com.client.GetObject(Class="Excel.Application")
         except:
             messagebox.showerror("错误", "没有检测到正在运行的 Excel。\n请手动打开新旧两个 Excel 文件后再试。")
             return
 
-        # 检查文件是否已打开
+        # 调试：输出 Excel 中所有工作簿路径
+        try:
+            wb_list = [wb.FullName for wb in self.excel_app.Workbooks]
+            self.log(f"当前 Excel 打开的文件: {wb_list}")
+        except:
+            pass
+
         if not find_workbook(self.excel_app, old):
             messagebox.showerror("错误", f"旧版文件未在 Excel 中打开:\n{old}\n请手动打开后重试。")
             return
@@ -376,10 +404,8 @@ class DiffViewer:
             elif sd.get('old_name'): self._navigate(sd['old_name'], 'A1')
 
     def _navigate(self, sheet_name, address):
-        """在已打开的 Excel 中选中单元格"""
         try:
-            if not self.excel_app:
-                return
+            if not self.excel_app: return
             old_wb = find_workbook(self.excel_app, self.old_path.get())
             new_wb = find_workbook(self.excel_app, self.new_path.get())
             for wb, desc in [(old_wb, "旧版"), (new_wb, "新版")]:
