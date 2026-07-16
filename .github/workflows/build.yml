@@ -1,4 +1,4 @@
-name: 打包EXE
+name: 打包 EXE
 
 on: workflow_dispatch
 
