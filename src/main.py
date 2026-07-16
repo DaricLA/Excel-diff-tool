@@ -1,11 +1,8 @@
 """
-Excel 差异对比工具（openpyxl 高速对比 + COM 跳转）
-- 使用 openpyxl 快速读取新旧 Excel 的所有信息
-- 支持单元格值、公式、字体、填充、边框、对齐、数字格式、合并单元格
-- 支持富文本（CellRichText）逐段比较
-- 支持图片数量及尺寸变化检测
-- 支持条件格式数量变化检测
-- 双击差异项，自动打开 Excel 并跳转到对应单元格
+Excel 差异对比工具（图片检测修复版）
+- openpyxl 高速对比 + COM 智能跳转
+- 增强图片检测：支持图片增减、尺寸变化
+- 详细条件格式比较、界面优化、窗口管理
 """
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -17,21 +14,24 @@ import win32com.client
 from win32com.client import constants
 from openpyxl import load_workbook
 from openpyxl.cell.rich_text import CellRichText
+from openpyxl.utils import get_column_letter
 
 # ---------------------------- 辅助函数 ----------------------------
 def rgb_to_hex(rgb):
-    """将 openpyxl 的颜色对象转换为 #RRGGBB 字符串"""
     if rgb is None or rgb.rgb is None:
         return "None"
     if isinstance(rgb.rgb, str):
         return rgb.rgb
-    # 如果 rgb 是 ARGB 字符串，去掉前两位透明度
     return str(rgb.rgb)[2:] if len(str(rgb.rgb)) == 8 else str(rgb.rgb)
 
 def cell_address(col_idx, row_idx):
-    """将列、行索引转换为 'A1' 格式"""
-    from openpyxl.utils import get_column_letter
     return f"{get_column_letter(col_idx)}{row_idx}"
+
+def normalize_path(path):
+    try:
+        return os.path.normpath(os.path.realpath(path))
+    except:
+        return os.path.normpath(path)
 
 # ---------------------------- openpyxl 对比引擎 ----------------------------
 class OpenpyxlComparer:
@@ -49,10 +49,8 @@ class OpenpyxlComparer:
 
     def run(self):
         self.progress(5, "加载旧版文件...")
-        self.log("正在使用 openpyxl 加载旧版文件...")
         old_wb = load_workbook(self.old_path, data_only=False)
         self.progress(15, "加载新版文件...")
-        self.log("正在加载新版文件...")
         new_wb = load_workbook(self.new_path, data_only=False)
 
         self._compare_sheets(old_wb, new_wb)
@@ -104,13 +102,11 @@ class OpenpyxlComparer:
         self._compare_conditional_formats(old_ws, new_ws, sheet_name)
 
     def _get_cell_diff(self, old_cell, new_cell):
-        # 值 / 公式变化
         old_val = old_cell.value
         new_val = new_cell.value
         if not self._value_equal(old_val, new_val):
             old_str = f"{old_val}" if old_val is not None else "(空)"
             new_str = f"{new_val}" if new_val is not None else "(空)"
-            # 富文本详细比较
             if isinstance(old_val, CellRichText) or isinstance(new_val, CellRichText):
                 rich_desc = self._rich_text_diff(old_val, new_val)
                 return {'type': '内容(含富文本)', 'desc': rich_desc}
@@ -120,7 +116,6 @@ class OpenpyxlComparer:
             else:
                 return {'type': '值变化', 'desc': f'{old_str} → {new_str}'}
 
-        # 格式比较
         descs = []
         font_diff = self._cmp_font(old_cell.font, new_cell.font)
         if font_diff: descs.append(f"字体: {font_diff}")
@@ -149,7 +144,6 @@ class OpenpyxlComparer:
         return v1 == v2
 
     def _rich_text_diff(self, old_rt, new_rt):
-        """生成富文本差异描述"""
         if not isinstance(old_rt, CellRichText):
             old_rt = CellRichText(str(old_rt) if old_rt else "")
         if not isinstance(new_rt, CellRichText):
@@ -174,7 +168,6 @@ class OpenpyxlComparer:
                     lines.append(f"段{i+1} '{seg}': 变为 '{t2.text}'")
         return "富文本格式变更:\n" + "\n".join(lines) if lines else "富文本格式有细微变化"
 
-    # ---------- 格式比较方法 ----------
     @staticmethod
     def _font_equal(f1, f2):
         return (f1.name == f2.name and f1.size == f2.size and f1.bold == f2.bold and
@@ -215,11 +208,9 @@ class OpenpyxlComparer:
         old_merged = set(str(m) for m in old_ws.merged_cells.ranges)
         new_merged = set(str(m) for m in new_ws.merged_cells.ranges)
         for addr in new_merged - old_merged:
-            start = addr.split(':')[0]
-            self.diffs.append({'sheet':sheet_name,'address':start,'type':'合并新增','desc':f'新增合并区域 {addr}'})
+            self.diffs.append({'sheet':sheet_name,'address':addr.split(':')[0],'type':'合并新增','desc':f'新增合并区域 {addr}'})
         for addr in old_merged - new_merged:
-            start = addr.split(':')[0]
-            self.diffs.append({'sheet':sheet_name,'address':start,'type':'合并删除','desc':f'删除合并区域 {addr}'})
+            self.diffs.append({'sheet':sheet_name,'address':addr.split(':')[0],'type':'合并删除','desc':f'删除合并区域 {addr}'})
 
     def _compare_row_col_dimensions(self, old_ws, new_ws, sheet_name):
         for row_idx, rd in old_ws.row_dimensions.items():
@@ -232,7 +223,6 @@ class OpenpyxlComparer:
                 nh = rd.height
                 if nh is not None:
                     self.diffs.append({'sheet':sheet_name,'address':f"A{row_idx}",'type':'行高新设置','desc':f'行高: {nh}'})
-
         for col_letter, cd in old_ws.column_dimensions.items():
             ow = cd.width
             nw = new_ws.column_dimensions[col_letter].width if col_letter in new_ws.column_dimensions else None
@@ -251,66 +241,130 @@ class OpenpyxlComparer:
                     self.diffs.append({'sheet':sheet_name,'address':addr,'type':'列宽新设置','desc':f'列宽({col_letter}): {nw}'})
 
     def _compare_images(self, old_ws, new_ws, sheet_name):
-        """比较图片：通过 openpyxl 的 drawing 获取图片信息"""
+        """获取图片列表：每个元素为 (锚点单元格地址, 宽度, 高度)"""
         def get_images(ws):
-            imgs = []
-            try:
-                if ws._drawing:
-                    for anchor in ws._drawing.anchors:
-                        if hasattr(anchor, 'image'):
-                            img = anchor.image
+            images = []
+            # 优先使用 _images 属性（openpyxl 3.0+）
+            if hasattr(ws, '_images') and ws._images:
+                for img in ws._images:
+                    try:
+                        # 获取锚点单元格
+                        anchor = img.anchor
+                        if hasattr(anchor, '_from'):
                             col = anchor._from.col
                             row = anchor._from.row
-                            imgs.append((cell_address(col, row), img.width, img.height))
-            except:
-                pass
-            return imgs
+                            addr = cell_address(col, row)
+                            images.append((addr, img.width, img.height))
+                    except:
+                        pass
+            # 备用方法：解析 drawing
+            elif hasattr(ws, '_drawing') and ws._drawing:
+                for anchor in ws._drawing.anchors:
+                    if hasattr(anchor, 'image'):
+                        img = anchor.image
+                        col = anchor._from.col
+                        row = anchor._from.row
+                        addr = cell_address(col, row)
+                        images.append((addr, img.width, img.height))
+            return sorted(images, key=lambda x: x[0])
+
         old_imgs = get_images(old_ws)
         new_imgs = get_images(new_ws)
-        if old_imgs != new_imgs:
+
+        if len(old_imgs) == 0 and len(new_imgs) == 0:
+            return
+
+        diff_detected = False
+        if len(old_imgs) != len(new_imgs):
+            diff_detected = True
+        else:
+            for (addr1, w1, h1), (addr2, w2, h2) in zip(old_imgs, new_imgs):
+                if addr1 != addr2 or abs(w1 - w2) > 0.1 or abs(h1 - h2) > 0.1:
+                    diff_detected = True
+                    break
+
+        if diff_detected:
             self.stats['images_diff'] += 1
             anchor = old_imgs[0][0] if old_imgs else (new_imgs[0][0] if new_imgs else 'A1')
-            self.diffs.append({'sheet':sheet_name,'address':anchor,'type':'图片差异','desc':f'图片数量/尺寸变化'})
+            desc_parts = [f"旧版 {len(old_imgs)} 张图片，新版 {len(new_imgs)} 张图片"]
+            if len(old_imgs) != len(new_imgs):
+                desc_parts.append("图片数量不同")
+            else:
+                desc_parts.append("图片尺寸或位置变化")
+            self.diffs.append({
+                'sheet': sheet_name,
+                'address': anchor,
+                'type': '图片差异',
+                'desc': '；'.join(desc_parts)
+            })
 
     def _compare_conditional_formats(self, old_ws, new_ws, sheet_name):
-        """比较条件格式数量"""
-        old_count = len(old_ws.conditional_formatting)
-        new_count = len(new_ws.conditional_formatting)
-        if old_count != new_count:
-            self.diffs.append({'sheet':sheet_name,'address':'A1','type':'条件格式数量变化','desc':f'条件格式: {old_count} → {new_count}'})
+        old_cfs = list(old_ws.conditional_formatting)
+        new_cfs = list(new_ws.conditional_formatting)
+        if len(old_cfs) == len(new_cfs) == 0:
+            return
+
+        def cf_to_dict(cf):
+            rules = []
+            for rule in cf.rules:
+                rules.append({
+                    'type': rule.type,
+                    'priority': rule.priority,
+                    'formula': str(rule.formula),
+                    'dxf': str(rule.dxf) if rule.dxf else None
+                })
+            return {'sqref': str(cf.sqref), 'rules': rules}
+
+        old_cf_dicts = [cf_to_dict(cf) for cf in old_cfs]
+        new_cf_dicts = [cf_to_dict(cf) for cf in new_cfs]
+
+        if old_cf_dicts != new_cf_dicts:
+            self.diffs.append({
+                'sheet': sheet_name,
+                'address': 'A1',
+                'type': '条件格式变化',
+                'desc': f'条件格式规则有差异 (旧版 {len(old_cfs)} 条, 新版 {len(new_cfs)} 条)'
+            })
 
 # ---------------------------- GUI + COM 跳转 ----------------------------
 class DiffViewer:
     def __init__(self, root):
         self.root = root
-        self.root.title("Excel 差异对比工具（高速 + 跳转）")
+        self.root.title("Excel 差异对比工具 (高速+跳转)")
         self.root.geometry("950x650")
+        self.root.option_add("*Font", ("微软雅黑", 10))
+
+        self.excel_app = None
+        self.old_wb = None
+        self.new_wb = None
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
 
         top = ttk.Frame(root, padding=10)
         top.pack(fill='x')
-        ttk.Label(top, text="旧版文件:").grid(row=0,column=0,sticky='w')
+        ttk.Label(top, text="旧版文件:", font=("微软雅黑", 10)).grid(row=0,column=0,sticky='w')
         ttk.Entry(top, textvariable=self.old_path, width=60).grid(row=0,column=1,padx=5)
         ttk.Button(top, text="浏览", command=lambda: self.browse(self.old_path)).grid(row=0,column=2)
-        ttk.Label(top, text="新版文件:").grid(row=1,column=0,sticky='w',pady=5)
+        ttk.Label(top, text="新版文件:", font=("微软雅黑", 10)).grid(row=1,column=0,sticky='w',pady=5)
         ttk.Entry(top, textvariable=self.new_path, width=60).grid(row=1,column=1,padx=5)
         ttk.Button(top, text="浏览", command=lambda: self.browse(self.new_path)).grid(row=1,column=2)
 
         btn_frame = ttk.Frame(top)
         btn_frame.grid(row=2,column=0,columnspan=3,pady=5)
-        self.start_btn = ttk.Button(btn_frame, text="开始对比", command=self.start_compare)
+        self.start_btn = tk.Button(btn_frame, text="开始对比", font=("微软雅黑", 11, "bold"),
+                                   bg="#0078D7", fg="white", width=12, command=self.start_compare)
         self.start_btn.pack(side='left',padx=5)
-        self.jump_btn = ttk.Button(btn_frame, text="跳转到选中项", command=self.jump_to_selected, state='disabled')
+        self.jump_btn = tk.Button(btn_frame, text="跳转到选中项", font=("微软雅黑", 10),
+                                  command=self.jump_to_selected, state='disabled')
         self.jump_btn.pack(side='left',padx=5)
 
         self.progress = ttk.Progressbar(root, mode='determinate')
-        self.progress.pack(fill='x',padx=10)
+        self.progress.pack(fill='x',padx=10,pady=(5,0))
 
         paned = ttk.PanedWindow(root, orient='horizontal')
         paned.pack(fill='both',expand=True,padx=10,pady=5)
         left = ttk.Frame(paned)
-        paned.add(left,weight=3)
+        paned.add(left,weight=2)
         self.tree = ttk.Treeview(left, columns=('address','type'), show='tree headings')
         self.tree.heading('#0',text='Sheet / 差异项'); self.tree.heading('address',text='位置'); self.tree.heading('type',text='类型')
         self.tree.column('#0',width=200); self.tree.column('address',width=80); self.tree.column('type',width=120)
@@ -320,14 +374,14 @@ class DiffViewer:
         self.tree.bind('<Double-1>', lambda e: self.jump_to_selected())
 
         right = ttk.Frame(paned)
-        paned.add(right,weight=2)
+        paned.add(right,weight=1)
         ttk.Label(right, text="差异详情", font=('微软雅黑',10,'bold')).pack(anchor='w')
-        self.detail = tk.Text(right, wrap='word', height=20)
+        self.detail = tk.Text(right, wrap='word', height=20, font=("微软雅黑", 10))
         self.detail.pack(fill='both',expand=True)
 
         logf = ttk.LabelFrame(root, text="日志", padding=5)
         logf.pack(fill='x',padx=10,pady=(0,10))
-        self.log_text = tk.Text(logf, height=6, wrap='word')
+        self.log_text = tk.Text(logf, height=6, wrap='word', font=("微软雅黑", 10))
         self.log_text.pack(fill='both',expand=True)
 
         self.diff_items = []
@@ -364,9 +418,13 @@ class DiffViewer:
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("对比失败", str(e)))
             finally:
-                self.root.after(0, lambda: self.start_btn.configure(state='normal'))
+                self.root.after(0, self.on_comparison_finished)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def on_comparison_finished(self):
+        self.start_btn.configure(state='normal')
+        self.progress['value'] = 100
 
     def populate_tree(self):
         diffs, sheet_diffs, stats = self.result_data
@@ -400,45 +458,65 @@ class DiffViewer:
             d = target['data']
             self.detail.delete('1.0','end')
             self.detail.insert('1.0', f"Sheet: {d['sheet']}\n单元格: {d['address']}\n类型: {d['type']}\n描述: {d['desc']}")
-            self._jump_to_excel(d['sheet'], d['address'])
+            sheet = d['sheet']
+            address = d['address']
         elif target['type'] == 'sheet_struct':
             sd = target['data']
             self.detail.delete('1.0','end')
             self.detail.insert('1.0', f"类型: {sd['type']}\n描述: {sd['desc']}")
             sheet = sd.get('name', sd.get('new_name'))
-            if sheet:
-                self._jump_to_excel(sheet, 'A1')
+            address = 'A1'
+        else:
+            return
 
-    def _jump_to_excel(self, sheet_name, address):
-        """使用 COM 打开 Excel 并跳转到指定单元格"""
+        self._navigate_and_focus(sheet, address)
+
+    def _navigate_and_focus(self, sheet_name, address):
         def navigate():
             pythoncom.CoInitialize()
             try:
-                excel = win32com.client.GetObject(Class="Excel.Application")
-            except:
-                # 如果没有 Excel 在运行，则启动一个新的
-                excel = win32com.client.DispatchEx("Excel.Application")
-                excel.Visible = True
-            excel.DisplayAlerts = False
-            old_wb = None
-            new_wb = None
-            try:
-                old_wb = excel.Workbooks.Open(self.old_path.get(), ReadOnly=True)
-                new_wb = excel.Workbooks.Open(self.new_path.get(), ReadOnly=True)
-                excel.Windows.Arrange(constants.xlArrangeStyleTiled)
-            except:
-                pass
-
-            for wb, desc in [(old_wb, "旧版"), (new_wb, "新版")]:
-                if wb:
+                if not self.excel_app:
                     try:
-                        ws = wb.Worksheets(sheet_name)
-                        ws.Activate()
-                        ws.Range(address).Select()
-                        self.log(f"{desc} 已跳转到 {sheet_name}!{address}")
-                    except Exception as e:
-                        self.log(f"{desc} 跳转失败: {e}")
-            pythoncom.CoUninitialize()
+                        self.excel_app = win32com.client.GetObject(Class="Excel.Application")
+                    except:
+                        self.excel_app = win32com.client.DispatchEx("Excel.Application")
+                        self.excel_app.Visible = True
+                    self.excel_app.DisplayAlerts = False
+
+                    old_path = normalize_path(self.old_path.get())
+                    new_path = normalize_path(self.new_path.get())
+                    self.old_wb = None
+                    self.new_wb = None
+                    for wb in self.excel_app.Workbooks:
+                        if normalize_path(wb.FullName) == old_path:
+                            self.old_wb = wb
+                        elif normalize_path(wb.FullName) == new_path:
+                            self.new_wb = wb
+
+                    if not self.old_wb:
+                        self.old_wb = self.excel_app.Workbooks.Open(old_path, ReadOnly=True)
+                    if not self.new_wb:
+                        self.new_wb = self.excel_app.Workbooks.Open(new_path, ReadOnly=True)
+                    self.excel_app.Windows.Arrange(constants.xlArrangeStyleTiled)
+
+                for wb, desc in [(self.old_wb, "旧版"), (self.new_wb, "新版")]:
+                    if wb:
+                        try:
+                            ws = wb.Worksheets(sheet_name)
+                            ws.Activate()
+                            ws.Range(address).Select()
+                            self.log(f"{desc} 已跳转到 {sheet_name}!{address}")
+                        except Exception as e:
+                            self.log(f"{desc} 跳转失败: {e}")
+
+                self.excel_app.Visible = True
+                self.excel_app.WindowState = constants.xlMaximized
+                self.root.after(100, lambda: self.root.lower())
+
+            except Exception as e:
+                self.log(f"跳转出错: {e}")
+            finally:
+                pythoncom.CoUninitialize()
 
         threading.Thread(target=navigate, daemon=True).start()
 
