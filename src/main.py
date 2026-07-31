@@ -428,7 +428,7 @@ class DiffViewer:
         bottom_frame.columnconfigure(0, weight=1)
         bottom_frame.columnconfigure(1, weight=1)
 
-        detailf = tb.LabelFrame(bottom_frame, text="差异详情", padding=5, bootstyle=INFO)
+        detailf = tb.Labelframe(bottom_frame, text="差异详情", padding=5, bootstyle=INFO)
         detailf.grid(row=0, column=0, sticky='nsew', padx=(0, 3))
         self.detail = tk.Text(detailf, height=6, wrap='word', font=("微软雅黑", 9),
                               bg='#ffffff', fg='#212529', relief='flat',
@@ -436,7 +436,7 @@ class DiffViewer:
                               highlightcolor='#0d6efd', padx=5, pady=5)
         self.detail.pack(fill='both', expand=True)
 
-        logf = tb.LabelFrame(bottom_frame, text="日志", padding=5, bootstyle=SECONDARY)
+        logf = tb.Labelframe(bottom_frame, text="日志", padding=5, bootstyle=SECONDARY)
         logf.grid(row=0, column=1, sticky='nsew', padx=(3, 0))
         self.log_text = tk.Text(logf, height=6, wrap='word', font=("微软雅黑", 9),
                                 bg='#ffffff', fg='#212529', relief='flat',
