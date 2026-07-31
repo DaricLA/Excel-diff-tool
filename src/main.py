@@ -1,12 +1,14 @@
 """
-Excel 差异对比工具（最终增强版）
+Excel 差异对比工具（最终增强版）- ttkbootstrap flatly 主题版
 - 每个条件格式差异单独列出，精确定位首单元格
 - 增强图片检测，openpyxl + COM 双重保障
 - 界面优化：按钮左置，路径缩短，详情/日志对调，置顶开关
 - 可靠富文本检测（lxml 解析）
 """
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import messagebox, filedialog
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
 import threading
 import time
 import os
@@ -361,58 +363,58 @@ class DiffViewer:
         self.root = root
         self.root.title("Excel 差异对比工具")
         self.root.geometry("1000x700")
-        self.root.option_add("*Font", ("微软雅黑", 9))
 
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
         self.topmost = tk.BooleanVar(value=False)
 
         # 顶部工具栏
-        toolbar = ttk.Frame(root)
-        toolbar.pack(fill='x', padx=5, pady=5)
+        toolbar = tb.Frame(root, padding=5)
+        toolbar.pack(fill='x')
 
-        # 左侧按钮
-        self.start_btn = tk.Button(toolbar, text="开始对比", font=("微软雅黑", 9, "bold"),
-                                   bg="#0078D7", fg="white", width=8, command=self.start_compare)
+        # 左侧按钮区
+        btn_frame = tb.Frame(toolbar)
+        btn_frame.pack(side='left', padx=(0, 10))
+
+        self.start_btn = tb.Button(btn_frame, text="开始对比", bootstyle=PRIMARY, width=8, command=self.start_compare)
         self.start_btn.pack(side='left', padx=2)
-        self.jump_btn = tk.Button(toolbar, text="跳转", font=("微软雅黑", 9),
-                                  command=self.jump_to_selected, state='disabled')
+        self.jump_btn = tb.Button(btn_frame, text="跳转", bootstyle=SECONDARY, width=6, command=self.jump_to_selected, state='disabled')
         self.jump_btn.pack(side='left', padx=2)
 
         # 文件路径区
-        path_frame = ttk.Frame(toolbar)
-        path_frame.pack(side='left', fill='x', expand=True, padx=10)
+        path_frame = tb.Frame(toolbar)
+        path_frame.pack(side='left', fill='x', expand=True, padx=(0, 10))
 
-        ttk.Label(path_frame, text="旧版:").grid(row=0, column=0, sticky='w')
-        self.old_entry = ttk.Entry(path_frame, textvariable=self.old_path, width=45)
-        self.old_entry.grid(row=0, column=1, padx=2, sticky='ew')
-        ttk.Button(path_frame, text="浏览", width=4, command=lambda: self.browse(self.old_path)).grid(row=0, column=2)
+        tb.Label(path_frame, text="旧版:").grid(row=0, column=0, sticky='w', padx=(0, 5), pady=2)
+        self.old_entry = tb.Entry(path_frame, textvariable=self.old_path)
+        self.old_entry.grid(row=0, column=1, sticky='ew', pady=2)
+        tb.Button(path_frame, text="浏览", bootstyle=INFO, width=6, command=lambda: self.browse(self.old_path)).grid(row=0, column=2, padx=(5, 0), pady=2)
 
-        ttk.Label(path_frame, text="新版:").grid(row=1, column=0, sticky='w', pady=2)
-        self.new_entry = ttk.Entry(path_frame, textvariable=self.new_path, width=45)
-        self.new_entry.grid(row=1, column=1, padx=2, sticky='ew')
-        ttk.Button(path_frame, text="浏览", width=4, command=lambda: self.browse(self.new_path)).grid(row=1, column=2)
+        tb.Label(path_frame, text="新版:").grid(row=1, column=0, sticky='w', padx=(0, 5), pady=2)
+        self.new_entry = tb.Entry(path_frame, textvariable=self.new_path)
+        self.new_entry.grid(row=1, column=1, sticky='ew', pady=2)
+        tb.Button(path_frame, text="浏览", bootstyle=INFO, width=6, command=lambda: self.browse(self.new_path)).grid(row=1, column=2, padx=(5, 0), pady=2)
 
         path_frame.columnconfigure(1, weight=1)
 
         # 置顶复选框
-        ttk.Checkbutton(toolbar, text="置顶", variable=self.topmost, command=self.toggle_topmost).pack(side='left', padx=5)
+        tb.Checkbutton(toolbar, text="置顶", variable=self.topmost, command=self.toggle_topmost, bootstyle="round-toggle").pack(side='left', padx=5)
 
         # 进度条
-        self.progress = ttk.Progressbar(root, mode='determinate')
-        self.progress.pack(fill='x', padx=5)
+        self.progress = tb.Progressbar(root, mode='determinate', bootstyle=PRIMARY)
+        self.progress.pack(fill='x', padx=5, pady=(0, 5))
 
         # 中央差异树
-        tree_frame = ttk.Frame(root)
-        tree_frame.pack(fill='both', expand=True, padx=5, pady=5)
-        self.tree = ttk.Treeview(tree_frame, columns=('address','type'), show='tree headings')
+        tree_frame = tb.Frame(root, padding=(5, 0))
+        tree_frame.pack(fill='both', expand=True)
+        self.tree = tb.Treeview(tree_frame, columns=('address','type'), show='tree headings', bootstyle=PRIMARY)
         self.tree.heading('#0', text='Sheet / 差异项')
         self.tree.heading('address', text='位置')
         self.tree.heading('type', text='类型')
         self.tree.column('#0', width=250)
         self.tree.column('address', width=80)
         self.tree.column('type', width=100)
-        scroll_y = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
+        scroll_y = tb.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview, bootstyle=ROUND)
         self.tree.configure(yscrollcommand=scroll_y.set)
         self.tree.pack(side='left', fill='both', expand=True)
         scroll_y.pack(side='right', fill='y')
@@ -421,19 +423,25 @@ class DiffViewer:
         self.tree.bind('<Double-1>', self.jump_to_selected)
 
         # 底部：详情（左）与日志（右）
-        bottom_frame = ttk.Frame(root)
-        bottom_frame.pack(fill='x', padx=5, pady=(0,5))
+        bottom_frame = tb.Frame(root, padding=5)
+        bottom_frame.pack(fill='x')
         bottom_frame.columnconfigure(0, weight=1)
         bottom_frame.columnconfigure(1, weight=1)
 
-        detailf = ttk.LabelFrame(bottom_frame, text="差异详情", padding=3)
-        detailf.grid(row=0, column=0, sticky='nsew', padx=(0,3))
-        self.detail = tk.Text(detailf, height=6, wrap='word', font=("微软雅黑", 9))
+        detailf = tb.LabelFrame(bottom_frame, text="差异详情", padding=5, bootstyle=INFO)
+        detailf.grid(row=0, column=0, sticky='nsew', padx=(0, 3))
+        self.detail = tk.Text(detailf, height=6, wrap='word', font=("微软雅黑", 9),
+                              bg='#ffffff', fg='#212529', relief='flat',
+                              highlightthickness=1, highlightbackground='#dee2e6',
+                              highlightcolor='#0d6efd', padx=5, pady=5)
         self.detail.pack(fill='both', expand=True)
 
-        logf = ttk.LabelFrame(bottom_frame, text="日志", padding=3)
-        logf.grid(row=0, column=1, sticky='nsew')
-        self.log_text = tk.Text(logf, height=6, wrap='word', font=("微软雅黑", 9))
+        logf = tb.LabelFrame(bottom_frame, text="日志", padding=5, bootstyle=SECONDARY)
+        logf.grid(row=0, column=1, sticky='nsew', padx=(3, 0))
+        self.log_text = tk.Text(logf, height=6, wrap='word', font=("微软雅黑", 9),
+                                bg='#ffffff', fg='#212529', relief='flat',
+                                highlightthickness=1, highlightbackground='#dee2e6',
+                                highlightcolor='#0d6efd', padx=5, pady=5)
         self.log_text.pack(fill='both', expand=True)
 
         self.diff_items = []
@@ -563,6 +571,6 @@ class DiffViewer:
         threading.Thread(target=navigate, daemon=True).start()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = DiffViewer(root)
-    root.mainloop()
+    app = tb.Window(themename="flatly")
+    viewer = DiffViewer(app)
+    app.mainloop()
