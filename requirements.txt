@@ -1,3 +1,4 @@
 pywin32
 openpyxl==3.1.2
 lxml
+ttkbootstrap>=1.10.0
