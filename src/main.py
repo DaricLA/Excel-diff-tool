@@ -101,25 +101,42 @@ def parse_rich_text_from_xlsx(xlsx_path):
             runs = _extract_runs_from_si(si)
             shared_runs.append(runs)
 
-    # 2. 解析 workbook.xml 获取 sheet 名与 sheet 文件的映射
+    # 2. 解析 workbook.xml + rels，正确映射 sheet 文件名与显示名
     sheet_name_map = {}  # sheet文件名(不含路径) -> sheet显示名
+    R_NS = '{http://schemas.openxmlformats.org/package/2006/relationships}'
+
+    # 先读 workbook.xml.rels，建立 rId -> target 路径映射
+    rid_to_target = {}
+    if 'xl/_rels/workbook.xml.rels' in zf.namelist():
+        rels_xml = zf.read('xl/_rels/workbook.xml.rels')
+        rels_root = etree.fromstring(rels_xml)
+        for rel in rels_root.findall(f'{R_NS}Relationship'):
+            rid = rel.get('Id', '')
+            target = rel.get('Target', '')
+            rid_to_target[rid] = target
+
+    # 再读 workbook.xml，拿到 sheet 名和 rId 的对应
     if 'xl/workbook.xml' in zf.namelist():
         wb_xml = zf.read('xl/workbook.xml')
         wb_root = etree.fromstring(wb_xml)
         sheets_elem = wb_root.find(f'{NS}sheets')
         if sheets_elem is not None:
-            for idx, sheet_elem in enumerate(sheets_elem.findall(f'{NS}sheet'), 1):
-                name = sheet_elem.get('name', f'Sheet{idx}')
-                sheet_id = sheet_elem.get('sheetId', str(idx))
-                # sheet 文件名通常是 sheet{id}.xml，但也可能有自定义
-                # 从 sheet ID 反查
-                sheet_name_map[f'sheet{sheet_id}.xml'] = name
+            R_NS_IN_WB = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+            for sheet_elem in sheets_elem.findall(f'{NS}sheet'):
+                name = sheet_elem.get('name', '')
+                rid = sheet_elem.get(f'{R_NS_IN_WB}id', '')
+                if rid and rid in rid_to_target:
+                    target = rid_to_target[rid]
+                    # target 可能是 worksheets/sheet1.xml 或 /xl/worksheets/sheet1.xml
+                    filename = target.split('/')[-1]
+                    if filename.endswith('.xml'):
+                        sheet_name_map[filename] = name
 
-    # 如果workbook解析失败，用文件名序号兜底
+    # 兜底：如果 rels 方式没拿到，按 sheet 序号猜
     if not sheet_name_map:
         sheet_files = sorted(
             [n for n in zf.namelist() if n.startswith('xl/worksheets/sheet') and n.endswith('.xml')],
-            key=lambda x: int(x.split('sheet')[1].split('.xml')[0])
+            key=lambda x: int(x.split('sheet')[1].split('.xml')[0]) if 'sheet' in x else 0
         )
         for idx, f in enumerate(sheet_files, 1):
             sheet_name_map[f.split('/')[-1]] = f'Sheet{idx}'
@@ -431,32 +448,42 @@ class OpenpyxlComparer:
         for addr in common:
             w1, h1 = old_set[addr]
             w2, h2 = new_set[addr]
-            if abs(w1 - w2) > 0.5 or abs(h1 - h2) > 0.5:
-                changed.append((addr, w1, h1, w2, h2))
+            # 使用相对误差 + 绝对误差组合判断尺寸变化
+            w_rel = abs(w1 - w2) / max(w1, w2) if max(w1, w2) > 0 else 0
+            h_rel = abs(h1 - h2) / max(h1, h2) if max(h1, h2) > 0 else 0
+            w_abs = abs(w1 - w2)
+            h_abs = abs(h1 - h2)
+            if w_rel > 0.01 or h_rel > 0.01:  # 相对变化超过1%
+                if w_abs > 1 or h_abs > 1:    # 且绝对变化超过1像素
+                    changed.append((addr, w1, h1, w2, h2))
 
-        if added or removed or changed:
-            self.stats['images_diff'] += 1
-            # 以第一个有差异的位置作为主锚点
-            all_diff_addrs = list(added) + list(removed) + [c[0] for c in changed]
-            anchor = sorted(all_diff_addrs)[0] if all_diff_addrs else 'A1'
-
-            parts = []
-            if added:
-                parts.append(f"新增图片 {len(added)} 张 ({', '.join(sorted(added))})")
-            if removed:
-                parts.append(f"删除图片 {len(removed)} 张 ({', '.join(sorted(removed))})")
-            if changed:
-                parts.append(f"尺寸变化 {len(changed)} 张")
-                for addr, w1, h1, w2, h2 in changed:
-                    parts.append(f"  {addr}: {w1:.0f}x{h1:.0f} → {w2:.0f}x{h2:.0f}")
-
-            desc = f"图片差异：旧版 {len(old_imgs)} 张，新版 {len(new_imgs)} 张\n" + "\n".join(parts)
-            self.diffs.append({
-                'sheet': sheet_name,
-                'address': anchor,
-                'type': '图片差异',
-                'desc': desc
-            })
+        diff_count = len(added) + len(removed) + len(changed)
+        if diff_count > 0:
+            self.stats['images_diff'] += diff_count
+            # 每条差异单独列出，方便逐条跳转
+            for addr in sorted(added):
+                w, h = new_set[addr]
+                self.diffs.append({
+                    'sheet': sheet_name,
+                    'address': addr,
+                    'type': '图片新增',
+                    'desc': f'新增图片 ({w:.0f}x{h:.0f})'
+                })
+            for addr in sorted(removed):
+                w, h = old_set[addr]
+                self.diffs.append({
+                    'sheet': sheet_name,
+                    'address': addr,
+                    'type': '图片删除',
+                    'desc': f'删除图片 ({w:.0f}x{h:.0f})'
+                })
+            for addr, w1, h1, w2, h2 in sorted(changed, key=lambda x: x[0]):
+                self.diffs.append({
+                    'sheet': sheet_name,
+                    'address': addr,
+                    'type': '图片尺寸变化',
+                    'desc': f'图片尺寸: {w1:.0f}x{h1:.0f} → {w2:.0f}x{h2:.0f}'
+                })
 
     def _compare_conditional_formats(self, old_ws, new_ws, sheet_name):
         old_cfs = list(old_ws.conditional_formatting)
@@ -511,7 +538,7 @@ class DiffViewer:
         # ========== 顶部工具栏（grid布局，按钮上下对齐） ==========
         toolbar = tb.Frame(root, padding=5)
         toolbar.pack(fill='x')
-        toolbar.columnconfigure(3, weight=1)   # 路径输入框列可拉伸
+        toolbar.columnconfigure(3, weight=1)   # 路径区域整体可拉伸
 
         # 开始对比按钮（占2行，info样式）
         self.start_btn = tb.Button(toolbar, text="开始对比", bootstyle=INFO, width=8, command=self.start_compare)
@@ -524,21 +551,26 @@ class DiffViewer:
         # 分隔
         tb.Separator(toolbar, orient='vertical').grid(row=0, column=2, rowspan=2, sticky='ns', padx=8)
 
+        # 路径区域 frame（内部自己管理标签+输入框+浏览，输入框占满剩余空间）
+        path_frame = tb.Frame(toolbar)
+        path_frame.grid(row=0, column=3, rowspan=2, sticky='nsew', padx=(0, 10))
+        path_frame.columnconfigure(1, weight=1)  # 输入框列可拉伸
+
         # 旧版行
-        tb.Label(toolbar, text="旧版:").grid(row=0, column=3, sticky='w', padx=(0, 5), pady=2)
-        self.old_entry = tb.Entry(toolbar, textvariable=self.old_path)
-        self.old_entry.grid(row=0, column=4, sticky='ew', pady=2)
-        tb.Button(toolbar, text="浏览", bootstyle=PRIMARY, width=6, command=lambda: self.browse(self.old_path)).grid(row=0, column=5, padx=(5, 0), pady=2)
+        tb.Label(path_frame, text="旧版:").grid(row=0, column=0, sticky='w', padx=(0, 5), pady=2)
+        self.old_entry = tb.Entry(path_frame, textvariable=self.old_path)
+        self.old_entry.grid(row=0, column=1, sticky='ew', pady=2)
+        tb.Button(path_frame, text="浏览", bootstyle=PRIMARY, width=6, command=lambda: self.browse(self.old_path)).grid(row=0, column=2, padx=(5, 0), pady=2)
 
         # 新版行
-        tb.Label(toolbar, text="新版:").grid(row=1, column=3, sticky='w', padx=(0, 5), pady=2)
-        self.new_entry = tb.Entry(toolbar, textvariable=self.new_path)
-        self.new_entry.grid(row=1, column=4, sticky='ew', pady=2)
-        tb.Button(toolbar, text="浏览", bootstyle=PRIMARY, width=6, command=lambda: self.browse(self.new_path)).grid(row=1, column=5, padx=(5, 0), pady=2)
+        tb.Label(path_frame, text="新版:").grid(row=1, column=0, sticky='w', padx=(0, 5), pady=2)
+        self.new_entry = tb.Entry(path_frame, textvariable=self.new_path)
+        self.new_entry.grid(row=1, column=1, sticky='ew', pady=2)
+        tb.Button(path_frame, text="浏览", bootstyle=PRIMARY, width=6, command=lambda: self.browse(self.new_path)).grid(row=1, column=2, padx=(5, 0), pady=2)
 
         # 置顶开关（占2行，右侧）
         tb.Checkbutton(toolbar, text="置顶", variable=self.topmost, command=self.toggle_topmost, bootstyle="round-toggle").grid(
-            row=0, column=6, rowspan=2, padx=(15, 5), pady=2, sticky='w')
+            row=0, column=4, rowspan=2, padx=(0, 5), pady=2, sticky='w')
 
         # 进度条
         self.progress = tb.Progressbar(root, mode='determinate', bootstyle=PRIMARY)
