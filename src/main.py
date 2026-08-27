@@ -836,17 +836,78 @@ class OpenpyxlComparer:
             self._buf_log(f"Sheet结构: {len([s for s in self.sheet_diffs if s['type']=='新增'])} 新增, "
                           f"{len([s for s in self.sheet_diffs if s['type']=='删除'])} 删除")
 
+    def _real_data_range(self, ws):
+        """ 获取sheet的实际数据范围，裁掉openpyxl误报的尾部空行/空列。 当max_row/max_column异常大（>50000）时，从底部向上扫描找到真正的数据边界。 """
+        max_row = ws.max_row or 0
+        max_col = ws.max_column or 0
+        if max_row == 0 or max_col == 0:
+            return 0, 0, 1, 1  # min_row, min_col, max_row, max_col
+
+        # 如果范围合理（<=50000行且<=200列），直接用
+        if max_row <= 50000 and max_col <= 200:
+            return 1, 1, max_row, max_col
+
+        # 异常大：从底部向上扫描，找最后一个有内容的行
+        # 每1000行跳查一次，快速定位
+        real_max_row = max_row
+        step = max(1, max_row // 100)
+        scan_start = max(1, max_row - step)
+
+        # 从底部往上扫描行
+        for r in range(max_row, 0, -1):
+            has_content = False
+            # 检查该行的cell是否有值或格式
+            for c in range(1, min(max_col + 1, 200)):  # 只检查前200列做快速判断
+                cell = ws.cell(row=r, column=c)
+                if cell.value is not None or cell.has_style:
+                    has_content = True
+                    break
+            if has_content:
+                real_max_row = r
+                break
+            # 如果已经扫过10000行还没找到内容，直接截断到scan_start
+            if max_row - r > 10000:
+                real_max_row = scan_start
+                break
+
+        # 同样处理列
+        real_max_col = max_col
+        for c in range(max_col, 0, -1):
+            has_content = False
+            for r in range(1, min(real_max_row + 1, 500)):  # 只检查前500行
+                cell = ws.cell(row=r, column=c)
+                if cell.value is not None or cell.has_style:
+                    has_content = True
+                    break
+            if has_content:
+                real_max_col = c
+                break
+            if max_col - c > 500:
+                real_max_col = min(max_col, 200)
+                break
+
+        return 1, 1, real_max_row, real_max_col
+
     def _compare_worksheet(self, old_ws, new_ws, sheet_name):
         """v3.2: 逐sheet对比，支持大文件分批进度更新"""
         opts = self.check_options
 
-        # 获取行列范围
-        old_max_row = old_ws.max_row or 0
-        new_max_row = new_ws.max_row or 0
-        old_max_col = old_ws.max_column or 0
-        new_max_col = new_ws.max_column or 0
-        max_row = max(old_max_row, new_max_row)
-        max_col = max(old_max_col, new_max_col)
+        # 获取实际数据范围（裁掉openpyxl误报的尾部空行/空列）
+        _, _, old_real_max_row, old_real_max_col = self._real_data_range(old_ws)
+        _, _, new_real_max_row, new_real_max_col = self._real_data_range(new_ws)
+
+        # 取两个版本的并集范围（保证不遗漏新增行列）
+        max_row = max(old_real_max_row, new_real_max_row)
+        max_col = max(old_real_max_col, new_real_max_col)
+
+        # 安全上限：单sheet最多处理50万行 × 500列（防止极端误报）
+        max_row = min(max_row, 500000)
+        max_col = min(max_col, 500)
+
+        old_max_row = old_real_max_row
+        new_max_row = new_real_max_row
+        old_max_col = old_real_max_col
+        new_max_col = new_real_max_col
 
         if max_row == 0 or max_col == 0:
             return
