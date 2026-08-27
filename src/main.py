@@ -1,11 +1,4 @@
-"""
-Excel 差异对比工具（最终增强版）- ttkbootstrap flatly 主题版
-- 每个条件格式差异单独列出，精确定位首单元格
-- 增强图片检测，openpyxl + COM 双重保障
-- 界面优化：按钮左置，路径缩短，详情/日志对调，置顶开关
-- 可靠富文本检测（zipfile + lxml 直接解析底层 XML）
-- 修复：图片位置 0-based 偏移、富文本检测失效
-"""
+""" Excel 差异对比工具 v3.0 - ttkbootstrap flatly 主题版 - 新增：13项检测项目独立开关 - 修复：公式单元格误报、字体/填充颜色比较误报、数字格式误报 - 优化：动态跳过空单元格、格式检查关闭时快速跳过 - 每个条件格式差异单独列出，精确定位首单元格 - 增强图片检测，openpyxl + COM 双重保障 - 可靠富文本检测（zipfile + lxml 直接解析底层 XML） """
 import tkinter as tk
 from tkinter import messagebox, filedialog
 import ttkbootstrap as tb
@@ -23,6 +16,48 @@ from lxml import etree
 
 NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 
+# ======================== 检测项默认配置 ========================
+DEFAULT_CHECK_OPTIONS = {
+    # 内容检测
+    'value': True,          # 值变化
+    'formula': True,        # 公式变化
+    'rich_text': True,      # 富文本
+    # 格式检测
+    'font': True,           # 字体
+    'fill': True,           # 填充/背景色
+    'border': True,         # 边框
+    'alignment': True,      # 对齐方式
+    'number_format': True,  # 数字格式
+    # 结构检测
+    'merged_cells': True,   # 合并单元格
+    'row_height': True,     # 行高
+    'col_width': True,      # 列宽
+    'images': True,         # 图片
+    'conditional_format': True,  # 条件格式
+}
+
+CHECK_OPTION_LABELS = {
+    'value': '值变化',
+    'formula': '公式变化',
+    'rich_text': '富文本',
+    'font': '字体',
+    'fill': '填充/背景色',
+    'border': '边框',
+    'alignment': '对齐方式',
+    'number_format': '数字格式',
+    'merged_cells': '合并单元格',
+    'row_height': '行高',
+    'col_width': '列宽',
+    'images': '图片',
+    'conditional_format': '条件格式',
+}
+
+CHECK_OPTION_GROUPS = [
+    ("内容检测", ['value', 'formula', 'rich_text']),
+    ("格式检测", ['font', 'fill', 'border', 'alignment', 'number_format']),
+    ("结构检测", ['merged_cells', 'row_height', 'col_width', 'images', 'conditional_format']),
+]
+
 # ---------------------------- 辅助函数 ----------------------------
 def rgb_to_hex(rgb):
     if rgb is None or rgb.rgb is None:
@@ -39,6 +74,34 @@ def normalize_path(path):
         return os.path.normpath(os.path.realpath(path))
     except:
         return os.path.normpath(path)
+
+def normalize_color_for_compare(color):
+    """ 将 openpyxl Color 对象规范化为可比较的元组。 解决 theme vs rgb 整体比较误判的问题。 """
+    if color is None:
+        return None
+    try:
+        # auto 类型视为无颜色
+        if hasattr(color, 'type') and color.type == 'auto':
+            return None
+        # theme 颜色
+        if hasattr(color, 'theme') and color.theme is not None:
+            tint = color.tint if color.tint is not None else 0.0
+            return ('theme', color.theme, round(tint, 4))
+        # indexed 颜色
+        if hasattr(color, 'indexed') and color.indexed is not None:
+            return ('indexed', color.indexed)
+        # rgb 颜色
+        if hasattr(color, 'rgb') and color.rgb is not None:
+            rgb = color.rgb
+            if isinstance(rgb, str):
+                # 统一去掉 alpha 通道
+                if len(rgb) == 8 and rgb[:2] in ('00', 'FF'):
+                    return ('rgb', rgb[2:].upper())
+                return ('rgb', rgb.upper())
+            return ('rgb', str(rgb).upper())
+    except Exception:
+        pass
+    return None
 
 # ---------------------------- 富文本底层解析 ----------------------------
 def _parse_rPr(rPr_elem):
@@ -63,12 +126,10 @@ def _parse_rPr(rPr_elem):
 def _extract_runs_from_si(si_elem):
     """从 sharedStrings 的 <si> 元素提取 run 列表，返回 [(text, font_dict)]"""
     runs = []
-    # 普通文本 <t>
     t_elem = si_elem.find(f'{NS}t')
     if t_elem is not None:
         runs.append((t_elem.text or '', None))
         return runs
-    # 富文本 <r>
     for r in si_elem.findall(f'{NS}r'):
         t_elem = r.find(f'{NS}t')
         text = t_elem.text if t_elem is not None else ''
@@ -78,11 +139,7 @@ def _extract_runs_from_si(si_elem):
     return runs
 
 def parse_rich_text_from_xlsx(xlsx_path):
-    """
-    直接从 xlsx 底层 XML 解析富文本信息。
-    返回：{sheet_name: {cell_ref: [(text, font_dict_or_None), ...]}}
-    只有确实存在富文本格式（非纯文本）的单元格才会被包含。
-    """
+    """ 直接从 xlsx 底层 XML 解析富文本信息。 返回：{sheet_name: {cell_ref: [(text, font_dict_or_None), ...]}} """
     result = {}
     if not os.path.isfile(xlsx_path):
         return result
@@ -92,7 +149,7 @@ def parse_rich_text_from_xlsx(xlsx_path):
     except:
         return result
 
-    # 1. 解析 sharedStrings.xml，建立 索引 -> run列表 映射
+    # 1. 解析 sharedStrings.xml
     shared_runs = []
     if 'xl/sharedStrings.xml' in zf.namelist():
         ss_xml = zf.read('xl/sharedStrings.xml')
@@ -101,11 +158,10 @@ def parse_rich_text_from_xlsx(xlsx_path):
             runs = _extract_runs_from_si(si)
             shared_runs.append(runs)
 
-    # 2. 解析 workbook.xml + rels，正确映射 sheet 文件名与显示名
-    sheet_name_map = {}  # sheet文件名(不含路径) -> sheet显示名
+    # 2. 解析 workbook.xml + rels
+    sheet_name_map = {}
     R_NS = '{http://schemas.openxmlformats.org/package/2006/relationships}'
 
-    # 先读 workbook.xml.rels，建立 rId -> target 路径映射
     rid_to_target = {}
     if 'xl/_rels/workbook.xml.rels' in zf.namelist():
         rels_xml = zf.read('xl/_rels/workbook.xml.rels')
@@ -115,7 +171,6 @@ def parse_rich_text_from_xlsx(xlsx_path):
             target = rel.get('Target', '')
             rid_to_target[rid] = target
 
-    # 再读 workbook.xml，拿到 sheet 名和 rId 的对应
     if 'xl/workbook.xml' in zf.namelist():
         wb_xml = zf.read('xl/workbook.xml')
         wb_root = etree.fromstring(wb_xml)
@@ -127,12 +182,10 @@ def parse_rich_text_from_xlsx(xlsx_path):
                 rid = sheet_elem.get(f'{R_NS_IN_WB}id', '')
                 if rid and rid in rid_to_target:
                     target = rid_to_target[rid]
-                    # target 可能是 worksheets/sheet1.xml 或 /xl/worksheets/sheet1.xml
                     filename = target.split('/')[-1]
                     if filename.endswith('.xml'):
                         sheet_name_map[filename] = name
 
-    # 兜底：如果 rels 方式没拿到，按 sheet 序号猜
     if not sheet_name_map:
         sheet_files = sorted(
             [n for n in zf.namelist() if n.startswith('xl/worksheets/sheet') and n.endswith('.xml')],
@@ -154,9 +207,8 @@ def parse_rich_text_from_xlsx(xlsx_path):
         sheet_data = {}
         for c in ws_root.findall(f'.//{NS}c'):
             ref = c.get('r', '')
-            t = c.get('t', '')  # 类型: s=共享字符串, inlineStr=内嵌富文本, str=公式字符串...
+            t = c.get('t', '')
             if t == 's':
-                # 共享字符串
                 v_elem = c.find(f'{NS}v')
                 if v_elem is not None and v_elem.text is not None:
                     try:
@@ -168,7 +220,6 @@ def parse_rich_text_from_xlsx(xlsx_path):
                     except (ValueError, IndexError):
                         pass
             elif t == 'inlineStr':
-                # 内嵌富文本
                 is_elem = c.find(f'{NS}is')
                 if is_elem is not None:
                     runs = _extract_runs_from_si(is_elem)
@@ -187,7 +238,6 @@ def compare_rich_text_runs(runs1, runs2):
     if runs1 is None and runs2 is None:
         return None
 
-    # 一边有富文本一边没有
     if (runs1 and not runs2) or (not runs1 and runs2):
         plain1 = ''.join(t for t, f in (runs1 or []))
         plain2 = ''.join(t for t, f in (runs2 or []))
@@ -220,7 +270,7 @@ def compare_rich_text_runs(runs1, runs2):
 
 # ---------------------------- 对比引擎 ----------------------------
 class OpenpyxlComparer:
-    def __init__(self, old_path, new_path, log_callback=None, progress_callback=None):
+    def __init__(self, old_path, new_path, log_callback=None, progress_callback=None, check_options=None):
         self.old_path = old_path
         self.new_path = new_path
         self.log = log_callback if log_callback else print
@@ -228,10 +278,20 @@ class OpenpyxlComparer:
         self.diffs = []
         self.sheet_diffs = []
         self.stats = {'total_cells':0, 'diff_cells':0, 'added_sheets':[], 'removed_sheets':[], 'images_diff':0}
-        self.old_rich = {}  # {sheet: {ref: runs}}
+        self.old_rich = {}
         self.new_rich = {}
+        # v3: 检测项开关
+        self.check_options = dict(DEFAULT_CHECK_OPTIONS)
+        if check_options:
+            self.check_options.update(check_options)
 
     def run(self):
+        opts = self.check_options
+        enabled = [CHECK_OPTION_LABELS[k] for k, v in opts.items() if v]
+        disabled = [CHECK_OPTION_LABELS[k] for k, v in opts.items() if not v]
+        if disabled:
+            self.log(f"已关闭 {len(disabled)} 项检测: {', '.join(disabled)}")
+
         self.progress(3, "解析富文本结构...")
         self.old_rich = parse_rich_text_from_xlsx(self.old_path)
         self.new_rich = parse_rich_text_from_xlsx(self.new_path)
@@ -268,18 +328,36 @@ class OpenpyxlComparer:
             self.sheet_diffs.append({'type':'删除Sheet', 'name':name, 'desc':f'Sheet "{name}" 只存在于旧版'})
 
     def _compare_worksheet(self, old_ws, new_ws, sheet_name):
-        max_row = max(old_ws.max_row, new_ws.max_row)
-        max_col = max(old_ws.max_column, new_ws.max_column)
+        max_row = max(old_ws.max_row or 1, new_ws.max_row or 1)
+        max_col = max(old_ws.max_column or 1, new_ws.max_column or 1)
         self.stats['total_cells'] += max_row * max_col
 
         old_sheet_rich = self.old_rich.get(sheet_name, {})
         new_sheet_rich = self.new_rich.get(sheet_name, {})
+
+        opts = self.check_options
+        # 预计算：是否有任何格式检查开启（用于快速跳过空单元格）
+        any_fmt = any(opts.get(k, True) for k in
+                      ['font', 'fill', 'border', 'alignment', 'number_format'])
+        has_content_check = any(opts.get(k, True) for k in ['value', 'formula', 'rich_text'])
 
         for row in range(1, max_row + 1):
             for col in range(1, max_col + 1):
                 old_cell = old_ws.cell(row, col)
                 new_cell = new_ws.cell(row, col)
                 ref = cell_address(col, row)
+
+                # === v3 提速：快速跳过两边都完全为空的单元格 ===
+                if old_cell.value is None and new_cell.value is None:
+                    if not any_fmt and ref not in old_sheet_rich and ref not in new_sheet_rich:
+                        continue
+                    # 即使有格式检查，如果两边都没有任何格式设置，也跳过
+                    if any_fmt and not has_content_check:
+                        if (old_cell.font.bold is None and old_cell.fill.fill_type in (None, 'none') and
+                            new_cell.font.bold is None and new_cell.fill.fill_type in (None, 'none')):
+                            # 进一步快速检查：格式大概率都是默认值
+                            pass  # 保守起见不跳过，让 _get_cell_diff 处理
+
                 diff = self._get_cell_diff(old_cell, new_cell, ref,
                                            old_sheet_rich.get(ref),
                                            new_sheet_rich.get(ref))
@@ -292,15 +370,21 @@ class OpenpyxlComparer:
                         'desc': diff['desc']
                     })
 
-        self._compare_merged_cells(old_ws, new_ws, sheet_name)
-        self._compare_row_col_dimensions(old_ws, new_ws, sheet_name)
-        self._compare_images(old_ws, new_ws, sheet_name)
-        self._compare_conditional_formats(old_ws, new_ws, sheet_name)
+        # 结构级比较（受开关控制）
+        if opts.get('merged_cells', True):
+            self._compare_merged_cells(old_ws, new_ws, sheet_name)
+        if opts.get('row_height', True) or opts.get('col_width', True):
+            self._compare_row_col_dimensions(old_ws, new_ws, sheet_name)
+        if opts.get('images', True):
+            self._compare_images(old_ws, new_ws, sheet_name)
+        if opts.get('conditional_format', True):
+            self._compare_conditional_formats(old_ws, new_ws, sheet_name)
 
     def _get_cell_diff(self, old_cell, new_cell, ref, old_runs, new_runs):
-        # 优先检测富文本（底层XML方式，更可靠）
-        if old_runs is not None or new_runs is not None:
-            # 纯文本侧包装成无格式 run，确保内容比较正确
+        opts = self.check_options
+
+        # === 富文本检查 ===
+        if opts.get('rich_text', True) and (old_runs is not None or new_runs is not None):
             r1 = old_runs if old_runs is not None else (
                 [(str(old_cell.value), None)] if old_cell.value is not None else [])
             r2 = new_runs if new_runs is not None else (
@@ -311,59 +395,148 @@ class OpenpyxlComparer:
 
         old_val = old_cell.value
         new_val = new_cell.value
-        if old_val != new_val:
+
+        # === v3 修复：公式处理 ===
+        old_is_formula = isinstance(old_val, str) and old_val.startswith('=')
+        new_is_formula = isinstance(new_val, str) and new_val.startswith('=')
+
+        # 修复：两边公式完全相同 → 不算内容差异（即使因引用数据不同导致显示值不同）
+        if old_is_formula and new_is_formula and old_val == new_val:
+            pass  # 公式相同，跳过内容检查，继续检查格式
+        elif old_val != new_val:
             old_str = f"{old_val}" if old_val is not None else "(空)"
             new_str = f"{new_val}" if new_val is not None else "(空)"
-            if isinstance(old_val, str) and old_val.startswith('=') or \
-               isinstance(new_val, str) and new_val.startswith('='):
-                return {'type': '公式变化', 'desc': f'{old_str} → {new_str}'}
+
+            if old_is_formula or new_is_formula:
+                # 涉及公式的变化
+                if opts.get('formula', True):
+                    return {'type': '公式变化', 'desc': f'{old_str} → {new_str}'}
             else:
-                return {'type': '值变化', 'desc': f'{old_str} → {new_str}'}
+                # 纯值变化
+                if opts.get('value', True):
+                    return {'type': '值变化', 'desc': f'{old_str} → {new_str}'}
+            # 对应的内容检查被关闭 → 继续检查格式
+
+        # === 格式检查 ===
+        if not any(opts.get(k, True) for k in ['font', 'fill', 'border', 'alignment', 'number_format']):
+            return None
 
         descs = []
-        font_diff = self._cmp_font(old_cell.font, new_cell.font)
-        if font_diff: descs.append(f"字体: {font_diff}")
-        fill_diff = self._cmp_fill(old_cell.fill, new_cell.fill)
-        if fill_diff: descs.append(f"填充: {fill_diff}")
-        border_diff = self._cmp_border(old_cell.border, new_cell.border)
-        if border_diff: descs.append(f"边框: {border_diff}")
-        align_diff = self._cmp_alignment(old_cell.alignment, new_cell.alignment)
-        if align_diff: descs.append(f"对齐: {align_diff}")
-        num_diff = old_cell.number_format != new_cell.number_format
-        if num_diff: descs.append(f"数字格式: {old_cell.number_format} → {new_cell.number_format}")
+        if opts.get('font', True):
+            font_diff = self._cmp_font(old_cell.font, new_cell.font)
+            if font_diff:
+                descs.append(f"字体: {font_diff}")
+        if opts.get('fill', True):
+            fill_diff = self._cmp_fill(old_cell.fill, new_cell.fill)
+            if fill_diff:
+                descs.append(f"填充: {fill_diff}")
+        if opts.get('border', True):
+            border_diff = self._cmp_border(old_cell.border, new_cell.border)
+            if border_diff:
+                descs.append(f"边框: {border_diff}")
+        if opts.get('alignment', True):
+            align_diff = self._cmp_alignment(old_cell.alignment, new_cell.alignment)
+            if align_diff:
+                descs.append(f"对齐: {align_diff}")
+        if opts.get('number_format', True):
+            # v3 修复：None 和 "General" 视为相同
+            old_fmt = old_cell.number_format if old_cell.number_format is not None else 'General'
+            new_fmt = new_cell.number_format if new_cell.number_format is not None else 'General'
+            if old_fmt != new_fmt:
+                descs.append(f"数字格式: {old_fmt} → {new_fmt}")
+
         if descs:
             return {'type': '格式变化', 'desc': '; '.join(descs)}
         return None
 
     def _cmp_font(self, f1, f2):
+        """v3 修复：规范化 None 值和颜色比较"""
         changes = []
-        if f1.name != f2.name: changes.append(f"字体名: {f1.name}→{f2.name}")
-        if f1.size != f2.size: changes.append(f"大小: {f1.size}→{f2.size}")
-        if f1.bold != f2.bold: changes.append(f"粗体: {f1.bold}→{f2.bold}")
-        if f1.italic != f2.italic: changes.append(f"斜体: {f1.italic}→{f2.italic}")
-        if f1.underline != f2.underline: changes.append(f"下划线: {f1.underline}→{f2.underline}")
-        if f1.color != f2.color: changes.append(f"颜色: {rgb_to_hex(f1.color)}→{rgb_to_hex(f2.color)}")
+        # 字体名：None 视为继承默认
+        n1 = f1.name if f1.name is not None else ''
+        n2 = f2.name if f2.name is not None else ''
+        if n1 != n2:
+            changes.append(f"字体名: {n1 or '默认'}→{n2 or '默认'}")
+
+        # 大小
+        s1 = f1.size if f1.size is not None else 0
+        s2 = f2.size if f2.size is not None else 0
+        if s1 != s2:
+            changes.append(f"大小: {s1}→{s2}")
+
+        # 粗体：None 视为 False
+        b1 = f1.bold if f1.bold is not None else False
+        b2 = f2.bold if f2.bold is not None else False
+        if b1 != b2:
+            changes.append(f"粗体: {b1}→{b2}")
+
+        # 斜体
+        i1 = f1.italic if f1.italic is not None else False
+        i2 = f2.italic if f2.italic is not None else False
+        if i1 != i2:
+            changes.append(f"斜体: {i1}→{i2}")
+
+        # 下划线
+        u1 = f1.underline if f1.underline is not None else False
+        u2 = f2.underline if f2.underline is not None else False
+        if u1 != u2:
+            changes.append(f"下划线: {u1}→{u2}")
+
+        # v3 修复：颜色规范化比较（解决 theme vs rgb 误判）
+        c1 = normalize_color_for_compare(f1.color)
+        c2 = normalize_color_for_compare(f2.color)
+        if c1 != c2:
+            changes.append(f"颜色: {rgb_to_hex(f1.color)}→{rgb_to_hex(f2.color)}")
+
         return '; '.join(changes) if changes else None
 
     def _cmp_fill(self, f1, f2):
-        if f1.fill_type != f2.fill_type or f1.start_color != f2.start_color or f1.end_color != f2.end_color:
-            return f"类型: {f1.fill_type}→{f2.fill_type}, 颜色: {rgb_to_hex(f1.start_color)}→{rgb_to_hex(f2.start_color)}"
+        """v3 修复：规范化填充颜色比较"""
+        # fill_type 比较（None 和 'none' 视为相同）
+        t1 = f1.fill_type if f1.fill_type is not None else 'none'
+        t2 = f2.fill_type if f2.fill_type is not None else 'none'
+
+        # 规范化颜色比较
+        sc1 = normalize_color_for_compare(f1.start_color)
+        sc2 = normalize_color_for_compare(f2.start_color)
+        ec1 = normalize_color_for_compare(f1.end_color)
+        ec2 = normalize_color_for_compare(f2.end_color)
+
+        if t1 != t2 or sc1 != sc2 or ec1 != ec2:
+            return (f"类型: {f1.fill_type}→{f2.fill_type}, "
+                    f"颜色: {rgb_to_hex(f1.start_color)}→{rgb_to_hex(f2.start_color)}")
         return None
 
     def _cmp_border(self, b1, b2):
+        """v3 修复：规范化边框颜色比较"""
         parts = []
         for side in ['left', 'right', 'top', 'bottom']:
             s1 = getattr(b1, side)
             s2 = getattr(b2, side)
-            if s1.style != s2.style or s1.color != s2.color:
+            # style 比较（None 和 'none' 视为相同）
+            st1 = s1.style if s1.style is not None else None
+            st2 = s2.style if s2.style is not None else None
+            # 颜色规范化
+            c1 = normalize_color_for_compare(s1.color)
+            c2 = normalize_color_for_compare(s2.color)
+            if st1 != st2 or c1 != c2:
                 parts.append(f"{side}: {s1.style}/{rgb_to_hex(s1.color)}→{s2.style}/{rgb_to_hex(s2.color)}")
         return '; '.join(parts) if parts else None
 
     def _cmp_alignment(self, a1, a2):
         changes = []
-        if a1.horizontal != a2.horizontal: changes.append(f"水平: {a1.horizontal}→{a2.horizontal}")
-        if a1.vertical != a2.vertical: changes.append(f"垂直: {a1.vertical}→{a2.vertical}")
-        if a1.wrap_text != a2.wrap_text: changes.append(f"自动换行: {a1.wrap_text}→{a2.wrap_text}")
+        h1 = a1.horizontal if a1.horizontal is not None else ''
+        h2 = a2.horizontal if a2.horizontal is not None else ''
+        if h1 != h2:
+            changes.append(f"水平: {h1 or '默认'}→{h2 or '默认'}")
+        v1 = a1.vertical if a1.vertical is not None else ''
+        v2 = a2.vertical if a2.vertical is not None else ''
+        if v1 != v2:
+            changes.append(f"垂直: {v1 or '默认'}→{v2 or '默认'}")
+        w1 = a1.wrap_text if a1.wrap_text is not None else False
+        w2 = a2.wrap_text if a2.wrap_text is not None else False
+        if w1 != w2:
+            changes.append(f"自动换行: {w1}→{w2}")
         return '; '.join(changes) if changes else None
 
     def _compare_merged_cells(self, old_ws, new_ws, sheet_name):
@@ -375,41 +548,43 @@ class OpenpyxlComparer:
             self.diffs.append({'sheet':sheet_name,'address':addr.split(':')[0],'type':'合并删除','desc':f'删除合并区域 {addr}'})
 
     def _compare_row_col_dimensions(self, old_ws, new_ws, sheet_name):
-        for row_idx, rd in old_ws.row_dimensions.items():
-            oh = rd.height
-            nh = new_ws.row_dimensions[row_idx].height if row_idx in new_ws.row_dimensions else None
-            if oh != nh:
-                self.diffs.append({'sheet':sheet_name,'address':f"A{row_idx}",'type':'行高变化','desc':f'行高: {oh} → {nh}'})
-        for row_idx, rd in new_ws.row_dimensions.items():
-            if row_idx not in old_ws.row_dimensions:
-                nh = rd.height
-                if nh is not None:
-                    self.diffs.append({'sheet':sheet_name,'address':f"A{row_idx}",'type':'行高新设置','desc':f'行高: {nh}'})
-        for col_letter, cd in old_ws.column_dimensions.items():
-            ow = cd.width
-            nw = new_ws.column_dimensions[col_letter].width if col_letter in new_ws.column_dimensions else None
-            if ow != nw:
-                col_idx = column_index_from_string(col_letter)
-                addr = cell_address(col_idx, 1)
-                self.diffs.append({'sheet':sheet_name,'address':addr,'type':'列宽变化','desc':f'列宽({col_letter}): {ow} → {nw}'})
-        for col_letter, cd in new_ws.column_dimensions.items():
-            if col_letter not in old_ws.column_dimensions:
-                nw = cd.width
-                if nw is not None:
+        opts = self.check_options
+        if opts.get('row_height', True):
+            for row_idx, rd in old_ws.row_dimensions.items():
+                oh = rd.height
+                nh = new_ws.row_dimensions[row_idx].height if row_idx in new_ws.row_dimensions else None
+                if oh != nh:
+                    self.diffs.append({'sheet':sheet_name,'address':f"A{row_idx}",'type':'行高变化','desc':f'行高: {oh} → {nh}'})
+            for row_idx, rd in new_ws.row_dimensions.items():
+                if row_idx not in old_ws.row_dimensions:
+                    nh = rd.height
+                    if nh is not None:
+                        self.diffs.append({'sheet':sheet_name,'address':f"A{row_idx}",'type':'行高新设置','desc':f'行高: {nh}'})
+        if opts.get('col_width', True):
+            for col_letter, cd in old_ws.column_dimensions.items():
+                ow = cd.width
+                nw = new_ws.column_dimensions[col_letter].width if col_letter in new_ws.column_dimensions else None
+                if ow != nw:
                     col_idx = column_index_from_string(col_letter)
                     addr = cell_address(col_idx, 1)
-                    self.diffs.append({'sheet':sheet_name,'address':addr,'type':'列宽新设置','desc':f'列宽({col_letter}): {nw}'})
+                    self.diffs.append({'sheet':sheet_name,'address':addr,'type':'列宽变化','desc':f'列宽({col_letter}): {ow} → {nw}'})
+            for col_letter, cd in new_ws.column_dimensions.items():
+                if col_letter not in old_ws.column_dimensions:
+                    nw = cd.width
+                    if nw is not None:
+                        col_idx = column_index_from_string(col_letter)
+                        addr = cell_address(col_idx, 1)
+                        self.diffs.append({'sheet':sheet_name,'address':addr,'type':'列宽新设置','desc':f'列宽({col_letter}): {nw}'})
 
     def _get_images_from_ws(self, ws):
-        """获取图片列表，返回 [(address, width, height)] —— address 使用 1-based 单元格坐标"""
+        """获取图片列表，返回 [(address, width, height)]"""
         images = []
-        # 方法1：_images
         if hasattr(ws, '_images') and ws._images:
             for img in ws._images:
                 try:
                     anchor = img.anchor
                     if anchor and hasattr(anchor, '_from'):
-                        col = anchor._from.col + 1  # 0-based → 1-based
+                        col = anchor._from.col + 1
                         row = anchor._from.row + 1
                         addr = cell_address(col, row)
                         images.append((addr, img.width, img.height))
@@ -417,7 +592,6 @@ class OpenpyxlComparer:
                     self.log(f"图片提取异常: {e}")
         if images:
             return sorted(images, key=lambda x: x[0])
-        # 方法2：_drawing
         if hasattr(ws, '_drawing') and ws._drawing:
             for anchor in ws._drawing.anchors:
                 if hasattr(anchor, 'image'):
@@ -448,39 +622,32 @@ class OpenpyxlComparer:
         for addr in common:
             w1, h1 = old_set[addr]
             w2, h2 = new_set[addr]
-            # 使用相对误差 + 绝对误差组合判断尺寸变化
             w_rel = abs(w1 - w2) / max(w1, w2) if max(w1, w2) > 0 else 0
             h_rel = abs(h1 - h2) / max(h1, h2) if max(h1, h2) > 0 else 0
             w_abs = abs(w1 - w2)
             h_abs = abs(h1 - h2)
-            if w_rel > 0.01 or h_rel > 0.01:  # 相对变化超过1%
-                if w_abs > 1 or h_abs > 1:    # 且绝对变化超过1像素
+            if w_rel > 0.01 or h_rel > 0.01:
+                if w_abs > 1 or h_abs > 1:
                     changed.append((addr, w1, h1, w2, h2))
 
         diff_count = len(added) + len(removed) + len(changed)
         if diff_count > 0:
             self.stats['images_diff'] += diff_count
-            # 每条差异单独列出，方便逐条跳转
             for addr in sorted(added):
                 w, h = new_set[addr]
                 self.diffs.append({
-                    'sheet': sheet_name,
-                    'address': addr,
-                    'type': '图片新增',
-                    'desc': f'新增图片 ({w:.0f}x{h:.0f})'
+                    'sheet': sheet_name, 'address': addr,
+                    'type': '图片新增', 'desc': f'新增图片 ({w:.0f}x{h:.0f})'
                 })
             for addr in sorted(removed):
                 w, h = old_set[addr]
                 self.diffs.append({
-                    'sheet': sheet_name,
-                    'address': addr,
-                    'type': '图片删除',
-                    'desc': f'删除图片 ({w:.0f}x{h:.0f})'
+                    'sheet': sheet_name, 'address': addr,
+                    'type': '图片删除', 'desc': f'删除图片 ({w:.0f}x{h:.0f})'
                 })
             for addr, w1, h1, w2, h2 in sorted(changed, key=lambda x: x[0]):
                 self.diffs.append({
-                    'sheet': sheet_name,
-                    'address': addr,
+                    'sheet': sheet_name, 'address': addr,
                     'type': '图片尺寸变化',
                     'desc': f'图片尺寸: {w1:.0f}x{h1:.0f} → {w2:.0f}x{h2:.0f}'
                 })
@@ -499,18 +666,14 @@ class OpenpyxlComparer:
             if old_cf is None:
                 start = rng.split(':')[0] if ':' in rng else rng
                 self.diffs.append({
-                    'sheet': sheet_name,
-                    'address': start,
-                    'type': '条件格式新增',
-                    'desc': f'新增条件格式范围: {rng}'
+                    'sheet': sheet_name, 'address': start,
+                    'type': '条件格式新增', 'desc': f'新增条件格式范围: {rng}'
                 })
             elif new_cf is None:
                 start = rng.split(':')[0] if ':' in rng else rng
                 self.diffs.append({
-                    'sheet': sheet_name,
-                    'address': start,
-                    'type': '条件格式删除',
-                    'desc': f'删除条件格式范围: {rng}'
+                    'sheet': sheet_name, 'address': start,
+                    'type': '条件格式删除', 'desc': f'删除条件格式范围: {rng}'
                 })
             else:
                 old_rules = [(r.type, r.priority, str(r.formula), str(r.dxf)) for r in old_cf.rules]
@@ -518,59 +681,141 @@ class OpenpyxlComparer:
                 if old_rules != new_rules:
                     start = rng.split(':')[0] if ':' in rng else rng
                     self.diffs.append({
-                        'sheet': sheet_name,
-                        'address': start,
-                        'type': '条件格式修改',
-                        'desc': f'条件格式规则变化，范围: {rng}'
+                        'sheet': sheet_name, 'address': start,
+                        'type': '条件格式修改', 'desc': f'条件格式规则变化，范围: {rng}'
                     })
+
+# ---------------------------- 检测项设置弹窗 ----------------------------
+class CheckOptionsDialog(tb.Toplevel):
+    """v3 新增：检测项目设置弹窗"""
+    def __init__(self, parent, current_options):
+        super().__init__(parent)
+        self.title("检测项目设置")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.result = None
+        self.vars = {}
+
+        # 主框架
+        main_frame = tb.Frame(self, padding=15)
+        main_frame.pack(fill='both', expand=True)
+
+        # 分组创建复选框
+        for group_name, keys in CHECK_OPTION_GROUPS:
+            lf = tb.Labelframe(main_frame, text=group_name, padding=(8, 5))
+            lf.pack(fill='x', pady=(0, 8))
+
+            # 每行放3个
+            row_frame = None
+            for i, key in enumerate(keys):
+                if i % 3 == 0:
+                    row_frame = tb.Frame(lf)
+                    row_frame.pack(fill='x', pady=1)
+                var = tk.BooleanVar(value=current_options.get(key, True))
+                self.vars[key] = var
+                cb = tb.Checkbutton(row_frame, text=CHECK_OPTION_LABELS[key],
+                                    variable=var, bootstyle="round-toggle")
+                cb.pack(side='left', padx=(0, 15))
+
+        # 按钮区
+        btn_frame = tb.Frame(main_frame)
+        btn_frame.pack(fill='x', pady=(12, 0))
+
+        tb.Button(btn_frame, text="全选", width=8,
+                  command=self._select_all).pack(side='left', padx=(0, 5))
+        tb.Button(btn_frame, text="全不选", width=8,
+                  command=self._deselect_all).pack(side='left', padx=(0, 5))
+
+        tb.Button(btn_frame, text="取消", width=8,
+                  command=self._on_cancel).pack(side='right', padx=(5, 0))
+        tb.Button(btn_frame, text="确定", bootstyle=PRIMARY, width=8,
+                  command=self._on_ok).pack(side='right')
+
+        # 居中显示
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        pw = parent.winfo_rootx() + parent.winfo_width() // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2
+        self.geometry(f"+{pw - w//2}+{ph - h//2}")
+
+        self.wait_window()
+
+    def _select_all(self):
+        for v in self.vars.values():
+            v.set(True)
+
+    def _deselect_all(self):
+        for v in self.vars.values():
+            v.set(False)
+
+    def _on_ok(self):
+        self.result = {k: v.get() for k, v in self.vars.items()}
+        self.destroy()
+
+    def _on_cancel(self):
+        self.result = None
+        self.destroy()
 
 # ---------------------------- GUI ----------------------------
 class DiffViewer:
     def __init__(self, root):
         self.root = root
-        self.root.title("Excel 差异对比工具")
-        self.root.geometry("1000x700")
+        self.root.title("Excel 差异对比工具 v3.0")
+        self.root.geometry("1050x720")
 
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
         self.topmost = tk.BooleanVar(value=False)
+        # v3: 检测项配置
+        self.check_options = dict(DEFAULT_CHECK_OPTIONS)
 
-        # ========== 顶部工具栏（grid布局，按钮上下对齐） ==========
+        # ========== 顶部工具栏 ==========
         toolbar = tb.Frame(root, padding=5)
         toolbar.pack(fill='x')
-        toolbar.columnconfigure(3, weight=1)   # 路径区域整体可拉伸
+        toolbar.columnconfigure(4, weight=1)
 
-        # 开始对比按钮（占2行，info样式）
-        self.start_btn = tb.Button(toolbar, text="开始对比", bootstyle=INFO, width=8, command=self.start_compare)
+        # 开始对比
+        self.start_btn = tb.Button(toolbar, text="开始对比", bootstyle=INFO, width=8,
+                                   command=self.start_compare)
         self.start_btn.grid(row=0, column=0, rowspan=2, sticky='nsew', padx=2, pady=1)
 
-        # 跳转按钮（占2行）
-        self.jump_btn = tb.Button(toolbar, text="跳转", bootstyle=SECONDARY, width=6, command=self.jump_to_selected, state='disabled')
+        # 跳转
+        self.jump_btn = tb.Button(toolbar, text="跳转", bootstyle=SECONDARY, width=6,
+                                  command=self.jump_to_selected, state='disabled')
         self.jump_btn.grid(row=0, column=1, rowspan=2, sticky='nsew', padx=2, pady=1)
 
+        # v3: 检测设置按钮
+        self.settings_btn = tb.Button(toolbar, text="⚙ 检测设置", bootstyle="outline",
+                                      width=10, command=self.open_check_options)
+        self.settings_btn.grid(row=0, column=2, rowspan=2, sticky='nsew', padx=2, pady=1)
+
         # 分隔
-        tb.Separator(toolbar, orient='vertical').grid(row=0, column=2, rowspan=2, sticky='ns', padx=8)
+        tb.Separator(toolbar, orient='vertical').grid(row=0, column=3, rowspan=2, sticky='ns', padx=8)
 
-        # 路径区域 frame（内部自己管理标签+输入框+浏览，输入框占满剩余空间）
+        # 路径区域
         path_frame = tb.Frame(toolbar)
-        path_frame.grid(row=0, column=3, rowspan=2, sticky='nsew', padx=(0, 10))
-        path_frame.columnconfigure(1, weight=1)  # 输入框列可拉伸
+        path_frame.grid(row=0, column=4, rowspan=2, sticky='nsew', padx=(0, 10))
+        path_frame.columnconfigure(1, weight=1)
 
-        # 旧版行
         tb.Label(path_frame, text="旧版:").grid(row=0, column=0, sticky='w', padx=(0, 5), pady=2)
         self.old_entry = tb.Entry(path_frame, textvariable=self.old_path)
         self.old_entry.grid(row=0, column=1, sticky='ew', pady=2)
-        tb.Button(path_frame, text="浏览", bootstyle=PRIMARY, width=6, command=lambda: self.browse(self.old_path)).grid(row=0, column=2, padx=(5, 0), pady=2)
+        tb.Button(path_frame, text="浏览", bootstyle=PRIMARY, width=6,
+                  command=lambda: self.browse(self.old_path)).grid(row=0, column=2, padx=(5, 0), pady=2)
 
-        # 新版行
         tb.Label(path_frame, text="新版:").grid(row=1, column=0, sticky='w', padx=(0, 5), pady=2)
         self.new_entry = tb.Entry(path_frame, textvariable=self.new_path)
         self.new_entry.grid(row=1, column=1, sticky='ew', pady=2)
-        tb.Button(path_frame, text="浏览", bootstyle=PRIMARY, width=6, command=lambda: self.browse(self.new_path)).grid(row=1, column=2, padx=(5, 0), pady=2)
+        tb.Button(path_frame, text="浏览", bootstyle=PRIMARY, width=6,
+                  command=lambda: self.browse(self.new_path)).grid(row=1, column=2, padx=(5, 0), pady=2)
 
-        # 置顶开关（占2行，右侧）
-        tb.Checkbutton(toolbar, text="置顶", variable=self.topmost, command=self.toggle_topmost, bootstyle="round-toggle").grid(
-            row=0, column=4, rowspan=2, padx=(0, 5), pady=2, sticky='w')
+        # 置顶开关
+        tb.Checkbutton(toolbar, text="置顶", variable=self.topmost,
+                       command=self.toggle_topmost, bootstyle="round-toggle").grid(
+            row=0, column=5, rowspan=2, padx=(0, 5), pady=2, sticky='w')
 
         # 进度条
         self.progress = tb.Progressbar(root, mode='determinate', bootstyle=PRIMARY)
@@ -579,7 +824,8 @@ class DiffViewer:
         # 中央差异树
         tree_frame = tb.Frame(root, padding=(5, 0))
         tree_frame.pack(fill='both', expand=True)
-        self.tree = tb.Treeview(tree_frame, columns=('address','type'), show='tree headings', bootstyle=PRIMARY)
+        self.tree = tb.Treeview(tree_frame, columns=('address','type'), show='tree headings',
+                                bootstyle=PRIMARY)
         self.tree.heading('#0', text='Sheet / 差异项')
         self.tree.heading('address', text='位置')
         self.tree.heading('type', text='类型')
@@ -594,13 +840,12 @@ class DiffViewer:
         self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
         self.tree.bind('<Double-1>', self.jump_to_selected)
 
-        # ========== 底部：差异详情（固定宽） + 日志（可拉伸） ==========
+        # ========== 底部：差异详情 + 日志 ==========
         bottom_frame = tb.Frame(root, padding=5)
         bottom_frame.pack(fill='x')
-        bottom_frame.columnconfigure(0, weight=0)   # 差异详情固定宽度
-        bottom_frame.columnconfigure(1, weight=1)   # 日志随窗口拉伸
+        bottom_frame.columnconfigure(0, weight=0)
+        bottom_frame.columnconfigure(1, weight=1)
 
-        # 差异详情（固定宽度，不随窗口缩放）
         detailf = tb.Labelframe(bottom_frame, text="差异详情", padding=5, bootstyle=INFO)
         detailf.grid(row=0, column=0, sticky='nsew', padx=(0, 3))
         detailf.grid_propagate(True)
@@ -610,7 +855,6 @@ class DiffViewer:
                               highlightcolor='#0d6efd', padx=5, pady=5)
         self.detail.pack(fill='both', expand=True)
 
-        # 日志（可拉伸）
         logf = tb.Labelframe(bottom_frame, text="日志", padding=5, bootstyle=SECONDARY)
         logf.grid(row=0, column=1, sticky='nsew', padx=(3, 0))
         self.log_text = tk.Text(logf, height=6, wrap='word', font=("微软雅黑", 9),
@@ -628,6 +872,16 @@ class DiffViewer:
 
     def toggle_topmost(self):
         self.root.attributes('-topmost', self.topmost.get())
+
+    def open_check_options(self):
+        """v3 新增：打开检测项目设置弹窗"""
+        dlg = CheckOptionsDialog(self.root, self.check_options)
+        if dlg.result is not None:
+            self.check_options = dlg.result
+            enabled_count = sum(1 for v in self.check_options.values() if v)
+            total_count = len(self.check_options)
+            self.settings_btn.configure(text=f"⚙ 检测设置 ({enabled_count}/{total_count})")
+            self.log(f"检测设置已更新：{enabled_count}/{total_count} 项已启用")
 
     def log(self, msg):
         self.log_text.insert('end', f"{time.strftime('%H:%M:%S')} {msg}\n")
@@ -647,9 +901,13 @@ class DiffViewer:
         self.detail.delete('1.0','end')
         self.diff_items = []
 
+        # v3: 传递检测配置
+        current_opts = dict(self.check_options)
+
         def worker():
             try:
-                comparer = OpenpyxlComparer(old, new, self.log, self.update_progress)
+                comparer = OpenpyxlComparer(old, new, self.log, self.update_progress,
+                                           check_options=current_opts)
                 comparer.run()
                 self.result_data = (comparer.diffs, comparer.sheet_diffs, comparer.stats)
                 self.root.after(0, self.populate_tree)
@@ -680,7 +938,9 @@ class DiffViewer:
                 node = self.tree.insert(pn,'end',text=d['desc'][:80],values=(d['address'],d['type']))
                 self.diff_items.append((node, {'type':'cell','data':d}))
         self.jump_btn.configure(state='normal')
-        self.log("树形列表已加载，单击查看详情，双击跳转")
+        enabled = sum(1 for v in self.check_options.values() if v)
+        total = len(self.check_options)
+        self.log(f"树形列表已加载，单击查看详情，双击跳转（当前启用 {enabled}/{total} 项检测）")
 
     def on_tree_select(self, event):
         sel = self.tree.selection()
