@@ -640,6 +640,7 @@ class OpenpyxlComparer:
         self.log = log_callback if log_callback else print
         self.progress = progress_callback if progress_callback else lambda v,s: None
         self.progress_mode = progress_mode_fn if progress_mode_fn else lambda m: None
+        self.stop_event = threading.Event()
         self.diffs = []
         self.sheet_diffs = []
         self.stats = {'total_cells':0, 'diff_cells':0, 'added_sheets':[], 'removed_sheets':[], 'images_diff':0}
@@ -775,6 +776,10 @@ class OpenpyxlComparer:
         compared = 0
 
         for idx, sheet_name in enumerate(common, 1):
+            if self.stop_event.is_set():
+                self._buf_log(f"用户请求停止，已跳过剩余 {total - idx + 1} 个sheet")
+                self._flush_log(force=True)
+                raise KeyboardInterrupt
             # v3.2: 跳过XML预检判定为完全相同的sheet
             if self.xml_skip_map.get(sheet_name, True) is False:
                 skipped += 1
@@ -836,55 +841,79 @@ class OpenpyxlComparer:
             self._buf_log(f"Sheet结构: {len([s for s in self.sheet_diffs if s['type']=='新增'])} 新增, "
                           f"{len([s for s in self.sheet_diffs if s['type']=='删除'])} 删除")
 
+    def _row_has_data(self, ws, row_idx, max_col_check):
+        """快速判断某行是否有实际数据（只看值，不看格式残留）"""
+        for c in range(1, max_col_check + 1):
+            cell = ws.cell(row=row_idx, column=c)
+            if cell.value is not None:
+                return True
+        return False
+
+    def _col_has_data(self, ws, col_idx, max_row_check):
+        """快速判断某列是否有实际数据（只看值，不看格式残留）"""
+        for r in range(1, max_row_check + 1):
+            cell = ws.cell(row=r, column=col_idx)
+            if cell.value is not None:
+                return True
+        return False
+
     def _real_data_range(self, ws):
-        """ 获取sheet的实际数据范围，裁掉openpyxl误报的尾部空行/空列。 当max_row/max_column异常大（>50000）时，从底部向上扫描找到真正的数据边界。 """
+        """ 获取sheet的实际数据范围，裁掉openpyxl误报的尾部空行/空列。 当max_row/max_column异常大时，使用二分查找快速定位真实数据边界。 """
         max_row = ws.max_row or 0
         max_col = ws.max_column or 0
         if max_row == 0 or max_col == 0:
-            return 0, 0, 1, 1  # min_row, min_col, max_row, max_col
+            return 0, 0, 1, 1
 
-        # 如果范围合理（<=50000行且<=200列），直接用
+        # 范围合理（<=50000行且<=200列），直接用
         if max_row <= 50000 and max_col <= 200:
             return 1, 1, max_row, max_col
 
-        # 异常大：从底部向上扫描，找最后一个有内容的行
-        # 每1000行跳查一次，快速定位
-        real_max_row = max_row
-        step = max(1, max_row // 100)
-        scan_start = max(1, max_row - step)
+        # 检查时最多看前500列（避免列数异常时扫描太慢）
+        check_cols = min(max_col, 500)
 
-        # 从底部往上扫描行
-        for r in range(max_row, 0, -1):
-            has_content = False
-            # 检查该行的cell是否有值或格式
-            for c in range(1, min(max_col + 1, 200)):  # 只检查前200列做快速判断
-                cell = ws.cell(row=r, column=c)
-                if cell.value is not None or cell.has_style:
-                    has_content = True
-                    break
-            if has_content:
-                real_max_row = r
-                break
-            # 如果已经扫过10000行还没找到内容，直接截断到scan_start
-            if max_row - r > 10000:
-                real_max_row = scan_start
-                break
+        # === 二分查找真实最大行 ===
+        # 策略：先快速压低上界，再二分精确定位
+        lo, hi = 1, max_row
+        real_max_row = 1
 
-        # 同样处理列
-        real_max_col = max_col
-        for c in range(max_col, 0, -1):
-            has_content = False
-            for r in range(1, min(real_max_row + 1, 500)):  # 只检查前500行
-                cell = ws.cell(row=r, column=c)
-                if cell.value is not None or cell.has_style:
-                    has_content = True
-                    break
-            if has_content:
-                real_max_col = c
-                break
-            if max_col - c > 500:
-                real_max_col = min(max_col, 200)
-                break
+        # 预检：从大到小快速压上界
+        if max_row > 100000 and not self._row_has_data(ws, 100000, check_cols):
+            hi = 100000
+        if hi > 20000 and not self._row_has_data(ws, 20000, check_cols):
+            hi = 20000
+        if hi > 5000 and not self._row_has_data(ws, 5000, check_cols):
+            hi = 5000
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._row_has_data(ws, mid, check_cols):
+                real_max_row = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        # === 二分查找真实最大列 ===
+        # 关键改进：上界取 max_col 和 real_max_col 的较小值
+        # 避免用 ws.max_column（可能也是虚高值）作为上界
+        check_rows = min(real_max_row, 500)
+        col_upper = min(max_col, 500)
+        # 先快速压列上界
+        if col_upper > 200 and not self._col_has_data(ws, 200, check_rows):
+            col_upper = 200
+        if col_upper > 50 and not self._col_has_data(ws, 50, check_rows):
+            col_upper = 50
+
+        real_max_col = 1
+        lo, hi = 1, col_upper
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._col_has_data(ws, mid, check_rows):
+                real_max_col = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        self._buf_log(f" [范围裁切] openpyxl报告 {max_row}行x{max_col}列 → 实际 {real_max_row}行x{real_max_col}列")
 
         return 1, 1, real_max_row, real_max_col
 
@@ -928,6 +957,8 @@ class OpenpyxlComparer:
         row_count = 0
 
         for row_idx in range(1, max_row + 1):
+            if self.stop_event.is_set():
+                raise KeyboardInterrupt
             old_row_data = None
             new_row_data = None
 
@@ -949,10 +980,13 @@ class OpenpyxlComparer:
                 if old_cell is None and new_cell is None:
                     continue
 
-                # 一边有一边无
+                # 一边有一边无（范围差异区域）
                 if old_cell is None or new_cell is None:
                     old_val = old_cell.value if old_cell else None
                     new_val = new_cell.value if new_cell else None
+                    # 只在实际值非None时才报告，避免空行/空列误报
+                    if old_val is None and new_val is None:
+                        continue
                     addr = cell_address(col_idx, row_idx)
                     if old_cell is None:
                         self.diffs.append({'sheet':sheet_name, 'address':addr, 'type':'单元格新增',
@@ -1339,8 +1373,8 @@ class DiffViewer:
         self.start_btn = tb.Button(toolbar, text="开始对比", bootstyle=INFO, width=8, command=self.start_compare)
         self.start_btn.grid(row=0, column=0, rowspan=2, sticky='nsew', padx=2, pady=1)
 
-        self.jump_btn = tb.Button(toolbar, text="跳转", bootstyle=SECONDARY, width=6, command=self.jump_to_selected, state='disabled')
-        self.jump_btn.grid(row=0, column=1, rowspan=2, sticky='nsew', padx=2, pady=1)
+        self.stop_btn = tb.Button(toolbar, text="停止检查", bootstyle=DANGER, width=8, command=self.stop_compare, state='disabled')
+        self.stop_btn.grid(row=0, column=1, rowspan=2, sticky='nsew', padx=2, pady=1)
 
         self.settings_btn = tb.Button(toolbar, text="⚙ 检测设置", bootstyle="outline", width=10, command=self.open_check_options)
         self.settings_btn.grid(row=0, column=2, rowspan=2, sticky='nsew', padx=2, pady=1)
@@ -1385,7 +1419,7 @@ class DiffViewer:
         scroll_y.pack(side='right', fill='y')
 
         self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
-        self.tree.bind('<Double-1>', self.jump_to_selected)
+        self.tree.bind('<Double-1>', lambda e: None)
 
         bottom_frame = tb.Frame(root, padding=5)
         bottom_frame.pack(fill='x')
@@ -1473,7 +1507,9 @@ class DiffViewer:
             messagebox.showerror("错误","请选择两个文件"); return
         if not os.path.isfile(old) or not os.path.isfile(new):
             messagebox.showerror("错误","文件不存在"); return
+        self.stop_event.clear()
         self.start_btn.configure(state='disabled')
+        self.stop_btn.configure(state='normal')
         self.tree.delete(*self.tree.get_children())
         self.detail.delete('1.0','end')
         self.diff_items = []
@@ -1489,6 +1525,9 @@ class DiffViewer:
                 comparer.run()
                 self.result_data = (comparer.diffs, comparer.sheet_diffs, comparer.stats)
                 self.root.after(0, self.populate_tree)
+            except KeyboardInterrupt:
+                self.result_data = ([], [], {'total_cells':0, 'diff_cells':0, 'added_sheets':[], 'removed_sheets':[], 'images_diff':0})
+                self.root.after(0, self.populate_tree)
             except Exception as e:
                 import traceback
                 tb_str = traceback.format_exc()
@@ -1500,6 +1539,9 @@ class DiffViewer:
 
     def on_comparison_finished(self):
         self.start_btn.configure(state='normal')
+        self.stop_btn.configure(state='disabled', bootstyle=DANGER)
+        if self.stop_event.is_set():
+            self.log("检查已停止")
         self.progress['value'] = 100
 
     def populate_tree(self):
@@ -1528,7 +1570,6 @@ class DiffViewer:
                 node = self.tree.insert(pn,'end',text=d['desc'][:80],values=(d['address'],d['type']))
                 self.diff_items.append((node, {'type':'cell','data':d}))
 
-        self.jump_btn.configure(state='normal')
         enabled = sum(1 for v in self.check_options.values() if v)
         total = len(self.check_options)
         plugin_info = f"，{len(plugin_diffs)} 个插件告警" if plugin_diffs else ""
@@ -1545,61 +1586,10 @@ class DiffViewer:
             self.detail.delete('1.0','end')
             self.detail.insert('1.0', f"Sheet: {d['sheet']}\n位置: {d.get('address','?')}\n类型: {d['type']}\n描述: {d['desc']}")
 
-    def jump_to_selected(self, event=None):
-        sel = self.tree.selection()
-        if not sel: return
-        node = sel[0]
-        target = next((d for n, d in self.diff_items if n == node), None)
-        if not target: return
-
-        if target['type'] == 'cell' or target['type'] == 'sheet_struct':
-            d = target['data']
-            sheet = d['sheet']
-            address = d.get('address', 'A1')
-        else:
-            return
-
-        if sheet == '🔍 数据检查':
-            self.log("数据检查结果不支持跳转")
-            return
-
-        def navigate():
-            pythoncom.CoInitialize()
-            try:
-                excel = win32com.client.GetObject(Class="Excel.Application")
-            except:
-                messagebox.showinfo("提示", "未检测到正在运行的 Excel 进程，请手动打开两个文件后再跳转。")
-                return
-
-            old_path = normalize_path(self.old_path.get())
-            new_path = normalize_path(self.new_path.get())
-            old_wb = new_wb = None
-            for wb in excel.Workbooks:
-                if normalize_path(wb.FullName) == old_path: old_wb = wb
-                elif normalize_path(wb.FullName) == new_path: new_wb = wb
-
-            if not old_wb or not new_wb:
-                missing = []
-                if not old_wb: missing.append(f"旧版: {self.old_path.get()}")
-                if not new_wb: missing.append(f"新版: {self.new_path.get()}")
-                messagebox.showinfo("文件未打开", "以下文件未打开：\n" + "\n".join(missing) + "\n请手动打开后重试。")
-                pythoncom.CoUninitialize()
-                return
-
-            for wb, desc in [(old_wb, "旧版"), (new_wb, "新版")]:
-                try:
-                    ws = wb.Worksheets(sheet)
-                    ws.Activate()
-                    excel.Goto(ws.Range(address), Scroll=True)
-                    self.log(f"{desc} 已跳转到 {sheet}!{address}")
-                except Exception as e:
-                    self.log(f"{desc} 跳转失败: {e}")
-
-            excel.Visible = True
-            excel.WindowState = -4137
-            pythoncom.CoUninitialize()
-
-        threading.Thread(target=navigate, daemon=True).start()
+    def stop_compare(self):
+        self.stop_event.set()
+        self.stop_btn.configure(state='disabled')
+        self.log("正在停止检查...")
 
 if __name__ == "__main__":
     app = tb.Window(themename="flatly")
