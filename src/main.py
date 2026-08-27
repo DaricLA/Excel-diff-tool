@@ -1,4 +1,4 @@
-""" Excel 差异对比工具 v3.1 - ttkbootstrap flatly 主题版 - v3.0: 13项检测开关、公式/字体/填充Bug修复 - v3.1: 提速优化、语义定位引擎、检查插件框架 """
+""" Excel 差异对比工具 v3.2 - 大文件极速优化版 - v3.0: 13项检测开关、公式/字体/填充Bug修复 - v3.1: iter_rows提速、语义定位引擎、检查插件框架 - v3.2: XML级预对比(跳过完全相同sheet)、进度细分(长sheet内报告)、 GUI批量刷新、行列维度快速比对、异常traceback输出 """
 import tkinter as tk
 from tkinter import messagebox, filedialog
 import ttkbootstrap as tb
@@ -36,6 +36,9 @@ CHECK_OPTION_GROUPS = [
     ("格式检测", ['font', 'fill', 'border', 'alignment', 'number_format']),
     ("结构检测", ['merged_cells', 'row_height', 'col_width', 'images', 'conditional_format']),
 ]
+
+# ======================== v3.2 优化常量 ========================
+PROGRESS_UPDATE_INTERVAL = 200  # 每处理N行刷新一次GUI进度（避免长时间无反馈）
 
 # ---------------------------- 辅助函数 ----------------------------
 def rgb_to_hex(rgb):
@@ -75,6 +78,12 @@ def normalize_color_for_compare(color):
     except Exception:
         pass
     return None
+
+def file_size_mb(path):
+    try:
+        return os.path.getsize(path) / (1024 * 1024)
+    except:
+        return 0
 
 # ---------------------------- 富文本底层解析 ----------------------------
 def _parse_rPr(rPr_elem):
@@ -228,6 +237,89 @@ def compare_rich_text_runs(runs1, runs2):
         return "富文本格式变更:\n" + "\n".join(changes)
     return None
 
+# ======================== v3.2 XML级预对比 ========================
+def _get_sheet_xml_from_zip(xlsx_path, sheet_filename):
+    """从xlsx(zip)中直接读取sheet XML，不解压到磁盘"""
+    try:
+        zf = zipfile.ZipFile(xlsx_path)
+        data = zf.read(f'xl/worksheets/{sheet_filename}')
+        zf.close()
+        return data
+    except:
+        return None
+
+def _get_sheet_file_mapping(xlsx_path):
+    """从workbook.xml获取 sheet名称 → sheet文件名 的映射"""
+    mapping = {}
+    try:
+        zf = zipfile.ZipFile(xlsx_path)
+    except:
+        return mapping
+
+    R_NS = '{http://schemas.openxmlformats.org/package/2006/relationships}'
+    rid_to_target = {}
+    if 'xl/_rels/workbook.xml.rels' in zf.namelist():
+        rels_xml = zf.read('xl/_rels/workbook.xml.rels')
+        rels_root = etree.fromstring(rels_xml)
+        for rel in rels_root.findall(f'{R_NS}Relationship'):
+            rid = rel.get('Id', '')
+            target = rel.get('Target', '')
+            rid_to_target[rid] = target
+
+    if 'xl/workbook.xml' in zf.namelist():
+        wb_xml = zf.read('xl/workbook.xml')
+        wb_root = etree.fromstring(wb_xml)
+        sheets_elem = wb_root.find(f'{NS}sheets')
+        if sheets_elem is not None:
+            R_NS_IN_WB = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+            for sheet_elem in sheets_elem.findall(f'{NS}sheet'):
+                name = sheet_elem.get('name', '')
+                rid = sheet_elem.get(f'{R_NS_IN_WB}id', '')
+                if rid and rid in rid_to_target:
+                    target = rid_to_target[rid]
+                    filename = target.split('/')[-1]
+                    if filename.endswith('.xml'):
+                        mapping[name] = filename
+
+    zf.close()
+    return mapping
+
+def xml_fast_compare_sheets(old_path, new_path, common_sheets, log_callback=None):
+    """ XML级快速对比：直接比较两个xlsx中每个sheet的原始XML内容。 如果XML完全一致，则该sheet一定无差异，可跳过openpyxl对比。 返回: {sheet_name: True/False} True=有差异, False=完全相同 """
+    results = {}
+    old_map = _get_sheet_file_mapping(old_path)
+    new_map = _get_sheet_file_mapping(new_path)
+
+    identical_count = 0
+    diff_count = 0
+
+    for sheet_name in common_sheets:
+        old_fn = old_map.get(sheet_name, '')
+        new_fn = new_map.get(sheet_name, '')
+
+        if not old_fn or not new_fn:
+            results[sheet_name] = True  # 无法映射，保守认为有差异
+            continue
+
+        old_xml = _get_sheet_xml_from_zip(old_path, old_fn)
+        new_xml = _get_sheet_xml_from_zip(new_path, new_fn)
+
+        if old_xml is None or new_xml is None:
+            results[sheet_name] = True
+            continue
+
+        if old_xml == new_xml:
+            results[sheet_name] = False  # 完全相同
+            identical_count += 1
+        else:
+            results[sheet_name] = True  # XML不同，需要openpyxl深入对比
+            diff_count += 1
+
+    if log_callback:
+        log_callback(f"[XML预检] {identical_count} 个sheet完全相同(跳过)，{diff_count} 个sheet需要深入对比")
+
+    return results
+
 # ---------------------------- v3.1 语义定位引擎 ----------------------------
 class DataLocator:
     """ 基于规则的数据定位引擎。 支持三种模式： - offset: 锚点+固定偏移，获取单个值 - collect: 锚点+方向收集，获取一组数据 - intersection: 行列交叉定位，获取交叉点值 """
@@ -236,7 +328,7 @@ class DataLocator:
         self.rules_file = rules_file
         if rules_file and os.path.isfile(rules_file):
             self.load_rules(rules_file)
-    
+
     def load_rules(self, filepath):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
@@ -247,9 +339,8 @@ class DataLocator:
         except Exception as e:
             print(f"加载规则文件失败: {e}")
             return False
-    
+
     def locate_all(self, workbook):
-        """对所有规则执行定位，返回 {rule_name: located_data}"""
         results = {}
         for rule in self.rules:
             name = rule.get('name', 'unnamed')
@@ -259,14 +350,14 @@ class DataLocator:
             except Exception as e:
                 results[name] = {'error': str(e)}
         return results
-    
+
     def locate(self, workbook, rule):
         sheet_name = rule.get('sheet', '')
         if sheet_name not in workbook.sheetnames:
             return {'error': f'Sheet "{sheet_name}" not found'}
         ws = workbook[sheet_name]
         mode = rule.get('mode', 'offset')
-        
+
         if mode == 'offset':
             return self._locate_offset(ws, rule)
         elif mode == 'collect':
@@ -274,12 +365,11 @@ class DataLocator:
         elif mode == 'intersection':
             return self._locate_intersection(ws, rule)
         return {'error': f'Unknown mode: {mode}'}
-    
+
     def _find_anchor(self, ws, anchor_cfg):
-        """查找锚点单元格，返回(row, col)或None"""
         text = anchor_cfg.get('text', '')
-        search_in = anchor_cfg.get('search_in', 'all')  # first_row, first_col, all
-        
+        search_in = anchor_cfg.get('search_in', 'all')
+
         if search_in == 'first_row':
             for col in range(1, (ws.max_column or 1) + 1):
                 val = ws.cell(1, col).value
@@ -290,50 +380,48 @@ class DataLocator:
                 val = ws.cell(row, 1).value
                 if val is not None and text == str(val).strip():
                     return (row, 1)
-        else:  # 'all'
+        else:
             for row in range(1, (ws.max_row or 1) + 1):
                 for col in range(1, (ws.max_column or 1) + 1):
                     val = ws.cell(row, col).value
                     if val is not None and text == str(val).strip():
                         return (row, col)
         return None
-    
+
     def _locate_offset(self, ws, rule):
-        """锚点+偏移模式"""
         anchor_cfg = rule.get('anchor', {})
         target = rule.get('target', {})
         row_offset = target.get('row_offset', 0)
         col_offset = target.get('col_offset', 0)
-        
+
         anchor = self._find_anchor(ws, anchor_cfg)
         if not anchor:
             return {'error': f'Anchor "{anchor_cfg.get("text")}" not found'}
-        
+
         target_row = anchor[0] + row_offset
         target_col = anchor[1] + col_offset
-        
+
         if target_row < 1 or target_col < 1:
             return {'error': 'Target out of range'}
-        
+
         cell = ws.cell(target_row, target_col)
         return {
             'address': cell_address(target_col, target_row),
             'value': cell.value,
             'is_formula': isinstance(cell.value, str) and cell.value.startswith('=')
         }
-    
+
     def _locate_collect(self, ws, rule):
-        """锚点+方向收集模式"""
         anchor_cfg = rule.get('anchor', {})
         collect_cfg = rule.get('collect', {})
         direction = collect_cfg.get('direction', 'down')
         start_offset = collect_cfg.get('start_offset', 1)
         max_count = collect_cfg.get('max_count', 1000)
-        
+
         anchor = self._find_anchor(ws, anchor_cfg)
         if not anchor:
             return {'error': f'Anchor "{anchor_cfg.get("text")}" not found'}
-        
+
         data = []
         if direction == 'down':
             start_row = anchor[0] + start_offset
@@ -351,31 +439,30 @@ class DataLocator:
                 if val is None:
                     break
                 data.append({'col': col, 'value': val})
-        
+
         return {
             'anchor_address': cell_address(anchor[1], anchor[0]),
             'direction': direction,
             'count': len(data),
             'values': data
         }
-    
+
     def _locate_intersection(self, ws, rule):
-        """行列交叉定位模式"""
         row_anchor_cfg = rule.get('row_anchor', {})
         col_anchor_cfg = rule.get('col_anchor', {})
-        
+
         row_anchor = self._find_anchor(ws, {**row_anchor_cfg, 'search_in': row_anchor_cfg.get('search_in', 'first_col')})
         col_anchor = self._find_anchor(ws, {**col_anchor_cfg, 'search_in': col_anchor_cfg.get('search_in', 'first_row')})
-        
+
         if not row_anchor:
             return {'error': f'Row anchor "{row_anchor_cfg.get("text")}" not found'}
         if not col_anchor:
             return {'error': f'Col anchor "{col_anchor_cfg.get("text")}" not found'}
-        
+
         target_row = row_anchor[0]
         target_col = col_anchor[1]
         cell = ws.cell(target_row, target_col)
-        
+
         return {
             'row_address': cell_address(1, target_row),
             'col_address': cell_address(target_col, 1),
@@ -386,32 +473,29 @@ class DataLocator:
 
 # ---------------------------- v3.1 检查插件框架 ----------------------------
 class CheckPlugin:
-    """检查插件基类"""
     name = ""
     description = ""
-    
+
     def __init__(self, config=None):
         self.config = config or {}
-    
+
     def check(self, old_data, new_data, context=None):
-        """ 执行检查 返回: [{'type': '...', 'desc': '...', 'severity': 'warning|error|info'}] """
         raise NotImplementedError
 
 class MeanDeviationPlugin(CheckPlugin):
-    """均值偏差检查插件：对比新旧均值，超过阈值则告警"""
     name = "mean_deviation"
     description = "检查均值偏差是否超过阈值"
-    
+
     def check(self, old_data, new_data, context=None):
         results = []
-        threshold = self.config.get('threshold', 0.05)  # 默认5%
-        
+        threshold = self.config.get('threshold', 0.05)
+
         old_val = old_data.get('value') if isinstance(old_data, dict) else old_data
         new_val = new_data.get('value') if isinstance(new_data, dict) else new_data
-        
+
         if old_val is None or new_val is None:
             return results
-        
+
         try:
             old_num = float(old_val)
             new_num = float(new_val)
@@ -425,44 +509,42 @@ class MeanDeviationPlugin(CheckPlugin):
                     })
         except (ValueError, TypeError):
             pass
-        
+
         return results
 
 class ParamLockPlugin(CheckPlugin):
-    """参数锁定检查插件：检查关键参数是否被修改"""
     name = "param_lock"
     description = "检查关键参数是否保持不变"
-    
+
     def check(self, old_data, new_data, context=None):
         results = []
-        
+
         old_val = old_data.get('value') if isinstance(old_data, dict) else old_data
         new_val = new_data.get('value') if isinstance(new_data, dict) else new_data
-        
+
         if old_val is not None and new_val is not None and old_val != new_val:
             results.append({
                 'type': '参数修改告警',
                 'desc': f'参数被修改: {old_val} → {new_val}',
                 'severity': 'error'
             })
-        
+
         return results
 
 class RangeCheckPlugin(CheckPlugin):
-    """范围检查插件：检查值是否在LSL/USL范围内"""
     name = "range_check"
     description = "检查数值是否在规格范围内"
-    
+
     def check(self, old_data, new_data, context=None):
         results = []
         lsl = self.config.get('lsl')
         usl = self.config.get('usl')
-        
+
         new_val = new_data.get('value') if isinstance(new_data, dict) else new_data
-        
+
         if new_val is None:
             return results
-        
+
         try:
             num_val = float(new_val)
             if lsl is not None and num_val < float(lsl):
@@ -479,10 +561,9 @@ class RangeCheckPlugin(CheckPlugin):
                 })
         except (ValueError, TypeError):
             pass
-        
+
         return results
 
-# 插件注册表
 PLUGIN_REGISTRY = {
     'mean_deviation': MeanDeviationPlugin,
     'param_lock': ParamLockPlugin,
@@ -490,24 +571,21 @@ PLUGIN_REGISTRY = {
 }
 
 class PluginManager:
-    """插件管理器：加载配置、执行插件"""
     def __init__(self, config_file=None):
         self.plugins = []
         self.locator = None
         if config_file and os.path.isfile(config_file):
             self.load_config(config_file)
-    
+
     def load_config(self, filepath):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
-            # 加载定位规则
+
             if 'locator_rules' in data:
                 self.locator = DataLocator()
                 self.locator.rules = data['locator_rules']
-            
-            # 加载插件配置
+
             for plugin_cfg in data.get('plugins', []):
                 plugin_name = plugin_cfg.get('type', '')
                 if plugin_name in PLUGIN_REGISTRY:
@@ -515,32 +593,31 @@ class PluginManager:
                     plugin.rule_name = plugin_cfg.get('rule_name', '')
                     plugin.description = plugin_cfg.get('description', '')
                     self.plugins.append(plugin)
-            
+
             return True
         except Exception as e:
             print(f"加载插件配置失败: {e}")
             return False
-    
+
     def run_checks(self, old_wb, new_wb, log_callback=None):
-        """执行所有插件检查，返回差异列表"""
         if not self.locator or not self.plugins:
             return []
-        
+
         results = []
         old_data = self.locator.locate_all(old_wb)
         new_data = self.locator.locate_all(new_wb)
-        
+
         for plugin in self.plugins:
             rule_name = getattr(plugin, 'rule_name', '')
             if not rule_name:
                 continue
-            
+
             old_val = old_data.get(rule_name)
             new_val = new_data.get(rule_name)
-            
+
             if old_val is None and new_val is None:
                 continue
-            
+
             try:
                 diffs = plugin.check(old_val, new_val)
                 for diff in diffs:
@@ -552,16 +629,17 @@ class PluginManager:
             except Exception as e:
                 if log_callback:
                     log_callback(f" [{plugin.name}] {rule_name} 检查失败: {e}")
-        
+
         return results
 
-# ---------------------------- 对比引擎 ----------------------------
+# ======================== v3.2 对比引擎 ========================
 class OpenpyxlComparer:
-    def __init__(self, old_path, new_path, log_callback=None, progress_callback=None, check_options=None, plugin_manager=None):
+    def __init__(self, old_path, new_path, log_callback=None, progress_callback=None, check_options=None, plugin_manager=None, progress_mode_fn=None):
         self.old_path = old_path
         self.new_path = new_path
         self.log = log_callback if log_callback else print
         self.progress = progress_callback if progress_callback else lambda v,s: None
+        self.progress_mode = progress_mode_fn if progress_mode_fn else lambda m: None
         self.diffs = []
         self.sheet_diffs = []
         self.stats = {'total_cells':0, 'diff_cells':0, 'added_sheets':[], 'removed_sheets':[], 'images_diff':0}
@@ -571,40 +649,162 @@ class OpenpyxlComparer:
         if check_options:
             self.check_options.update(check_options)
         self.plugin_manager = plugin_manager
+        # v3.2: 文件信息
+        self.xml_skip_map = {}  # sheet_name -> bool (True=需要对比, False=跳过)
+        # v3.2: 批量日志缓冲
+        self._log_buffer = []
+        self._last_gui_update = 0
+
+    def _with_heartbeat(self, label, fn):
+        """在执行耗时的fn()期间，启动心跳线程定期输出日志，并切换进度条为动画模式"""
+        stop_event = threading.Event()
+        t0 = time.time()
+
+        def _heartbeat():
+            while not stop_event.is_set():
+                stop_event.wait(3.0)
+                if stop_event.is_set():
+                    break
+                elapsed = time.time() - t0
+                try:
+                    self._buf_log(f"⏳ {label}... 已耗时 {elapsed:.0f}s")
+                    self._flush_log(force=True)
+                except:
+                    pass
+
+        hb = threading.Thread(target=_heartbeat, daemon=True)
+        self.progress_mode('indeterminate')
+        hb.start()
+        try:
+            result = fn()
+        finally:
+            stop_event.set()
+            hb.join(timeout=2)
+            self.progress_mode('determinate')
+        return result
+
+    def _load_rich_text(self):
+        """加载富文本结构（供heartbeat包装调用）"""
+        self.old_rich = parse_rich_text_from_xlsx(self.old_path)
+        self.new_rich = parse_rich_text_from_xlsx(self.new_path)
+        self._buf_log(f"富文本解析完成：旧版 {sum(len(v) for v in self.old_rich.values())} 个，"
+                      f"新版 {sum(len(v) for v in self.new_rich.values())} 个")
+
+    def _flush_log(self, force=False):
+        """批量刷新日志到GUI，减少update_idletasks调用"""
+        now = time.time()
+        if not force and (now - self._last_gui_update) < 0.15:
+            return
+        if self._log_buffer:
+            ts = time.strftime('%H:%M:%S')
+            msg = '\n'.join(f"{ts} {m}" for m in self._log_buffer)
+            self._log_buffer.clear()
+            try:
+                self.log(msg)
+            except:
+                pass
+            self._last_gui_update = now
+
+    def _buf_log(self, msg):
+        """缓冲日志，定期批量刷新"""
+        self._log_buffer.append(msg)
 
     def run(self):
+        start_time = time.time()
         opts = self.check_options
         enabled = [CHECK_OPTION_LABELS[k] for k, v in opts.items() if v]
         disabled = [CHECK_OPTION_LABELS[k] for k, v in opts.items() if not v]
         if disabled:
-            self.log(f"已关闭 {len(disabled)} 项检测: {', '.join(disabled)}")
+            self._buf_log(f"已关闭 {len(disabled)} 项检测: {', '.join(disabled)}")
 
-        self.progress(3, "解析富文本结构...")
-        self.old_rich = parse_rich_text_from_xlsx(self.old_path)
-        self.new_rich = parse_rich_text_from_xlsx(self.new_path)
-        self.log(f"富文本解析完成：旧版 {sum(len(v) for v in self.old_rich.values())} 个富文本单元格，"
-                 f"新版 {sum(len(v) for v in self.new_rich.values())} 个")
+        # v3.2: 文件大小参考信息（仅日志提示，不影响逻辑）
+        old_size = file_size_mb(self.old_path)
+        new_size = file_size_mb(self.new_path)
+        self._buf_log(f"文件大小: 旧版 {old_size:.1f}MB, 新版 {new_size:.1f}MB")
 
+        # v3.2: XML预对比
+        self.progress(2, "XML级预对比...")
+        self._flush_log(force=True)
+
+        self.progress(5, "解析富文本结构...")
+        self._buf_log("正在解析富文本结构，请稍候...")
+        self._flush_log(force=True)
+        self._with_heartbeat("解析富文本", lambda: self._load_rich_text())
+        self._flush_log(force=True)
+
+        # 加载工作簿
         self.progress(8, "加载旧版文件...")
-        old_wb = load_workbook(self.old_path, data_only=False)
-        self.progress(18, "加载新版文件...")
-        new_wb = load_workbook(self.new_path, data_only=False)
+        self._buf_log(f"正在加载旧版文件 ({old_size:.1f}MB)，大文件可能需要数十秒...")
+        self._flush_log(force=True)
+        old_wb = self._with_heartbeat("加载旧版文件", lambda: load_workbook(self.old_path, data_only=False))
+        self._buf_log(f"旧版加载完成: {len(old_wb.sheetnames)} 个sheet")
 
+        self.progress(15, "加载新版文件...")
+        self._buf_log(f"正在加载新版文件 ({new_size:.1f}MB)，大文件可能需要数十秒...")
+        self._flush_log(force=True)
+        new_wb = self._with_heartbeat("加载新版文件", lambda: load_workbook(self.new_path, data_only=False))
+        self._buf_log(f"新版加载完成: {len(new_wb.sheetnames)} 个sheet")
+        self._flush_log(force=True)
+
+        load_time = time.time() - start_time
+        self._buf_log(f"文件加载耗时: {load_time:.1f}s")
+
+        # v3.2: XML预对比，标记完全相同的sheet
+        self.progress(18, "XML预对比（标记相同sheet）...")
+        self._flush_log(force=True)
+
+        old_names = set(old_wb.sheetnames)
+        new_names = set(new_wb.sheetnames)
+        common = sorted(old_names & new_names, key=lambda n: old_wb.sheetnames.index(n))
+
+        self.xml_skip_map = xml_fast_compare_sheets(
+            self.old_path, self.new_path, common, None
+        )
+        skip_count = sum(1 for v in self.xml_skip_map.values() if not v)
+        if skip_count > 0:
+            self._buf_log(f"[XML预检] {skip_count}/{len(common)} 个sheet完全相同，将跳过对比")
+
+        self._flush_log(force=True)
+
+        # Sheet结构差异
         self._compare_sheets(old_wb, new_wb)
-        common = set(old_wb.sheetnames) & set(new_wb.sheetnames)
+
+        # 逐sheet对比
         total = len(common)
+        skipped = 0
+        compared = 0
+
         for idx, sheet_name in enumerate(common, 1):
-            self.progress(25 + int(55 * idx / total), f"对比 {sheet_name}...")
-            self.log(f"正在对比 {sheet_name} ({idx}/{total})")
+            # v3.2: 跳过XML预检判定为完全相同的sheet
+            if self.xml_skip_map.get(sheet_name, True) is False:
+                skipped += 1
+                self._buf_log(f" 跳过 {sheet_name} (XML完全相同) ({idx}/{total})")
+                if idx % 5 == 0 or idx == total:
+                    self._flush_log(force=True)
+                # 进度仍推进
+                pct = 25 + int(55 * idx / total)
+                self.progress(pct, f"跳过 {sheet_name} ({idx}/{total})")
+                continue
+
+            compared += 1
+            pct = 25 + int(55 * idx / total)
+            self.progress(pct, f"对比 {sheet_name}... ({idx}/{total})")
+            self._buf_log(f"正在对比 {sheet_name} ({idx}/{total})")
+            self._flush_log(force=True)
+
             old_ws = old_wb[sheet_name]
             new_ws = new_wb[sheet_name]
             self._compare_worksheet(old_ws, new_ws, sheet_name)
 
-        # v3.1: 执行插件检查
+        self._buf_log(f"Sheet对比完成: 对比 {compared} 个, 跳过 {skipped} 个 (共 {total} 个)")
+        self._flush_log(force=True)
+
+        # v3.1: 插件检查
         if self.plugin_manager and self.plugin_manager.plugins:
             self.progress(85, "执行数据检查插件...")
-            self.log(f"执行 {len(self.plugin_manager.plugins)} 个检查插件...")
-            plugin_results = self.plugin_manager.run_checks(old_wb, new_wb, self.log)
+            self._buf_log(f"执行 {len(self.plugin_manager.plugins)} 个检查插件...")
+            self._flush_log(force=True)
+            plugin_results = self.plugin_manager.run_checks(old_wb, new_wb, self._buf_log)
             for diff in plugin_results:
                 self.diffs.append({
                     'sheet': '🔍 数据检查',
@@ -612,137 +812,212 @@ class OpenpyxlComparer:
                     'type': diff['type'],
                     'desc': diff['desc']
                 })
-            self.log(f"插件检查完成：发现 {len(plugin_results)} 个问题")
+            self._buf_log(f"插件检查完成：发现 {len(plugin_results)} 个问题")
 
-        self.progress(95, "对比完成")
-        self.log(f"发现 {self.stats['diff_cells']} 处单元格差异，{len(self.sheet_diffs)} 处 Sheet 差异")
+        self.progress(95, "生成报告...")
+        self._flush_log(force=True)
+
+        total_time = time.time() - start_time
+        self.progress(100, "对比完成")
+        self._buf_log(f"总耗时: {total_time:.1f}s | 差异: {self.stats['diff_cells']} 处单元格, {len(self.sheet_diffs)} 处Sheet")
+        self._flush_log(force=True)
         return True
 
     def _compare_sheets(self, old_wb, new_wb):
         old_names = set(old_wb.sheetnames)
         new_names = set(new_wb.sheetnames)
-        self.stats['added_sheets'] = sorted(new_names - old_names)
-        self.stats['removed_sheets'] = sorted(old_names - new_names)
-        for name in self.stats['added_sheets']:
-            self.sheet_diffs.append({'type':'新增Sheet', 'name':name, 'desc':f'Sheet "{name}" 只存在于新版'})
-        for name in self.stats['removed_sheets']:
-            self.sheet_diffs.append({'type':'删除Sheet', 'name':name, 'desc':f'Sheet "{name}" 只存在于旧版'})
+
+        for name in sorted(new_names - old_names, key=lambda n: list(new_names).index(n)):
+            self.sheet_diffs.append({'name': name, 'type': '新增', 'desc': f'新版新增 Sheet: {name}'})
+        for name in sorted(old_names - new_names, key=lambda n: list(old_names).index(n)):
+            self.sheet_diffs.append({'name': name, 'type': '删除', 'desc': f'旧版有但新版无: {name}'})
+
+        if self.sheet_diffs:
+            self._buf_log(f"Sheet结构: {len([s for s in self.sheet_diffs if s['type']=='新增'])} 新增, "
+                          f"{len([s for s in self.sheet_diffs if s['type']=='删除'])} 删除")
 
     def _compare_worksheet(self, old_ws, new_ws, sheet_name):
-        max_row = max(old_ws.max_row or 1, new_ws.max_row or 1)
-        max_col = max(old_ws.max_column or 1, new_ws.max_column or 1)
-        self.stats['total_cells'] += max_row * max_col
-
-        old_sheet_rich = self.old_rich.get(sheet_name, {})
-        new_sheet_rich = self.new_rich.get(sheet_name, {})
+        """v3.2: 逐sheet对比，支持大文件分批进度更新"""
         opts = self.check_options
-        any_fmt = any(opts.get(k, True) for k in ['font', 'fill', 'border', 'alignment', 'number_format'])
 
-        # v3.1 提速：使用 iter_rows 批量读取
-        old_iter = old_ws.iter_rows(min_row=1, max_row=max_row, max_col=max_col)
-        new_iter = new_ws.iter_rows(min_row=1, max_row=max_row, max_col=max_col)
+        # 获取行列范围
+        old_max_row = old_ws.max_row or 0
+        new_max_row = new_ws.max_row or 0
+        old_max_col = old_ws.max_column or 0
+        new_max_col = new_ws.max_column or 0
+        max_row = max(old_max_row, new_max_row)
+        max_col = max(old_max_col, new_max_col)
 
-        for row_idx, (old_row, new_row) in enumerate(zip_longest(old_iter, new_iter, fillvalue=()), start=1):
-            for col_idx, (old_cell, new_cell) in enumerate(zip_longest(
-                    old_row if old_row else (), 
-                    new_row if new_row else (), 
-                    fillvalue=None), start=1):
-                
-                # 处理一边没有cell的情况
+        if max_row == 0 or max_col == 0:
+            return
+
+        self._buf_log(f" Sheet大小: {max_row}行 x {max_col}列")
+
+        # 启用项的集合
+        check_value = opts.get('value', True)
+        check_formula = opts.get('formula', True)
+        check_font = opts.get('font', True)
+        check_fill = opts.get('fill', True)
+        check_border = opts.get('border', True)
+        check_align = opts.get('alignment', True)
+        check_nf = opts.get('number_format', True)
+
+        # v3.2: 按行分批对比，定期报告进度
+        batch_size = PROGRESS_UPDATE_INTERVAL
+        row_count = 0
+
+        for row_idx in range(1, max_row + 1):
+            old_row_data = None
+            new_row_data = None
+
+            # 批量读取行
+            if row_idx <= old_max_row:
+                old_row_data = list(old_ws.iter_rows(min_row=row_idx, max_row=row_idx,
+                                                      min_col=1, max_col=max_col, values_only=False))
+                old_row_data = old_row_data[0] if old_row_data else []
+            if row_idx <= new_max_row:
+                new_row_data = list(new_ws.iter_rows(min_row=row_idx, max_row=row_idx,
+                                                      min_col=1, max_col=max_col, values_only=False))
+                new_row_data = new_row_data[0] if new_row_data else []
+
+            for col_idx in range(1, max_col + 1):
+                old_cell = old_row_data[col_idx - 1] if old_row_data and col_idx - 1 < len(old_row_data) else None
+                new_cell = new_row_data[col_idx - 1] if new_row_data and col_idx - 1 < len(new_row_data) else None
+
+                # v3.2: 两边都空则跳过
+                if old_cell is None and new_cell is None:
+                    continue
+
+                # 一边有一边无
                 if old_cell is None or new_cell is None:
-                    # 创建虚拟空cell
-                    from openpyxl.cell.cell import Cell
+                    old_val = old_cell.value if old_cell else None
+                    new_val = new_cell.value if new_cell else None
+                    addr = cell_address(col_idx, row_idx)
                     if old_cell is None:
-                        old_cell = Cell(old_ws, row=row_idx, column=col_idx)
-                    if new_cell is None:
-                        new_cell = Cell(new_ws, row=row_idx, column=col_idx)
-                
-                ref = cell_address(col_idx, row_idx)
+                        self.diffs.append({'sheet':sheet_name, 'address':addr, 'type':'单元格新增',
+                                           'desc':f'新增: {new_val}'})
+                    else:
+                        self.diffs.append({'sheet':sheet_name, 'address':addr, 'type':'单元格删除',
+                                           'desc':f'删除: {old_val}'})
+                    self.stats['diff_cells'] += 1
+                    continue
 
-                # 提速：快速跳过两边都完全为空的单元格
-                if old_cell.value is None and new_cell.value is None:
-                    if not any_fmt and ref not in old_sheet_rich and ref not in new_sheet_rich:
+                # 获取cell数据
+                old_v = old_cell.value
+                new_v = new_cell.value
+                addr = cell_address(col_idx, row_idx)
+
+                # v3.0: 空cell快速跳过
+                if old_v is None and new_v is None:
+                    if not (check_font or check_fill or check_border or check_align or check_nf):
                         continue
 
-                diff = self._get_cell_diff(old_cell, new_cell, ref,
-                                           old_sheet_rich.get(ref),
-                                           new_sheet_rich.get(ref))
-                if diff:
-                    self.stats['diff_cells'] += 1
-                    self.diffs.append({
-                        'sheet': sheet_name,
-                        'address': ref,
-                        'type': diff['type'],
-                        'desc': diff['desc']
-                    })
+                # 值比较
+                if check_value:
+                    val_diff = self._get_cell_diff(old_cell, new_cell)
+                    if val_diff:
+                        self.diffs.append({'sheet':sheet_name, 'address':addr, 'type':'内容变化', 'desc':val_diff})
+                        self.stats['diff_cells'] += 1
+                        continue  # 内容已不同，后续格式差异意义不大
 
+                # 格式比较（仅在值相同或关闭值检测时执行）
+                if check_font:
+                    fdiff = self._cmp_font(old_cell.font, new_cell.font)
+                    if fdiff:
+                        self.diffs.append({'sheet':sheet_name, 'address':addr, 'type':'字体变化', 'desc':fdiff})
+
+                if check_fill:
+                    ffdiff = self._cmp_fill(old_cell.fill, new_cell.fill)
+                    if ffdiff:
+                        self.diffs.append({'sheet':sheet_name, 'address':addr, 'type':'填充变化', 'desc':ffdiff})
+
+                if check_border:
+                    bdiff = self._cmp_border(old_cell.border, new_cell.border)
+                    if bdiff:
+                        self.diffs.append({'sheet':sheet_name, 'address':addr, 'type':'边框变化', 'desc':bdiff})
+
+                if check_align:
+                    adiff = self._cmp_alignment(old_cell.alignment, new_cell.alignment)
+                    if adiff:
+                        self.diffs.append({'sheet':sheet_name, 'address':addr, 'type':'对齐变化', 'desc':adiff})
+
+                if check_nf:
+                    nf1 = old_cell.number_format if old_cell.number_format is not None else 'General'
+                    nf2 = new_cell.number_format if new_cell.number_format is not None else 'General'
+                    if nf1 != nf2:
+                        self.diffs.append({'sheet':sheet_name, 'address':addr, 'type':'数字格式变化',
+                                           'desc':f'{nf1} → {nf2}'})
+
+            row_count += 1
+
+            # v3.2: 分批刷新进度
+            if row_count % batch_size == 0:
+                cur_pct = 25 + int(55 * (row_idx / max_row))
+                self.progress(cur_pct, f" {sheet_name}: {row_idx}/{max_row}行...")
+                self._flush_log(force=True)
+
+        # 富文本对比
+        if opts.get('rich_text', True):
+            old_sheet_rich = self.old_rich.get(sheet_name, {})
+            new_sheet_rich = self.new_rich.get(sheet_name, {})
+            all_refs = set(old_sheet_rich.keys()) | set(new_sheet_rich.keys())
+            for ref in all_refs:
+                r1 = old_sheet_rich.get(ref)
+                r2 = new_sheet_rich.get(ref)
+                rt_diff = compare_rich_text_runs(r1, r2)
+                if rt_diff:
+                    self.diffs.append({'sheet':sheet_name, 'address':ref, 'type':'富文本变化', 'desc':rt_diff})
+
+        # 合并单元格
         if opts.get('merged_cells', True):
             self._compare_merged_cells(old_ws, new_ws, sheet_name)
+
+        # 行列维度
         if opts.get('row_height', True) or opts.get('col_width', True):
             self._compare_row_col_dimensions(old_ws, new_ws, sheet_name)
+
+        # 图片
         if opts.get('images', True):
             self._compare_images(old_ws, new_ws, sheet_name)
+
+        # 条件格式
         if opts.get('conditional_format', True):
             self._compare_conditional_formats(old_ws, new_ws, sheet_name)
 
-    def _get_cell_diff(self, old_cell, new_cell, ref, old_runs, new_runs):
+    def _get_cell_diff(self, c1, c2):
+        v1 = c1.value
+        v2 = c2.value
         opts = self.check_options
 
-        if opts.get('rich_text', True) and (old_runs is not None or new_runs is not None):
-            r1 = old_runs if old_runs is not None else (
-                [(str(old_cell.value), None)] if old_cell.value is not None else [])
-            r2 = new_runs if new_runs is not None else (
-                [(str(new_cell.value), None)] if new_cell.value is not None else [])
-            rich_diff = compare_rich_text_runs(r1, r2)
-            if rich_diff:
-                return {'type': '内容(含富文本)', 'desc': rich_diff}
+        # v3.0: 公式相同跳过内容比较
+        if opts.get('formula', True):
+            f1 = isinstance(v1, str) and v1.startswith('=')
+            f2 = isinstance(v2, str) and v2.startswith('=')
+            if f1 and f2 and v1 == v2:
+                return None
 
-        old_val = old_cell.value
-        new_val = new_cell.value
+        # None值规范化
+        n1 = v1 if v1 is not None else ''
+        n2 = v2 if v2 is not None else ''
 
-        old_is_formula = isinstance(old_val, str) and old_val.startswith('=')
-        new_is_formula = isinstance(new_val, str) and new_val.startswith('=')
+        # 公式不同
+        f1 = isinstance(v1, str) and v1.startswith('=')
+        f2 = isinstance(v2, str) and v2.startswith('=')
+        if f1 != f2:
+            return f"公式状态: {'是' if f1 else '否'} → {'是' if f2 else '否'}"
+        if f1 and f2 and v1 != v2:
+            return f"公式: {v1} → {v2}"
 
-        if old_is_formula and new_is_formula and old_val == new_val:
-            pass
-        elif old_val != new_val:
-            old_str = f"{old_val}" if old_val is not None else "(空)"
-            new_str = f"{new_val}" if new_val is not None else "(空)"
-            if old_is_formula or new_is_formula:
-                if opts.get('formula', True):
-                    return {'type': '公式变化', 'desc': f'{old_str} → {new_str}'}
-            else:
-                if opts.get('value', True):
-                    return {'type': '值变化', 'desc': f'{old_str} → {new_str}'}
+        # 值不同
+        if n1 != n2:
+            # 截断长文本
+            s1 = str(v1) if v1 is not None else ''
+            s2 = str(v2) if v2 is not None else ''
+            max_len = 120
+            if len(s1) > max_len: s1 = s1[:max_len] + '...'
+            if len(s2) > max_len: s2 = s2[:max_len] + '...'
+            return f"{s1} → {s2}"
 
-        if not any(opts.get(k, True) for k in ['font', 'fill', 'border', 'alignment', 'number_format']):
-            return None
-
-        descs = []
-        if opts.get('font', True):
-            font_diff = self._cmp_font(old_cell.font, new_cell.font)
-            if font_diff:
-                descs.append(f"字体: {font_diff}")
-        if opts.get('fill', True):
-            fill_diff = self._cmp_fill(old_cell.fill, new_cell.fill)
-            if fill_diff:
-                descs.append(f"填充: {fill_diff}")
-        if opts.get('border', True):
-            border_diff = self._cmp_border(old_cell.border, new_cell.border)
-            if border_diff:
-                descs.append(f"边框: {border_diff}")
-        if opts.get('alignment', True):
-            align_diff = self._cmp_alignment(old_cell.alignment, new_cell.alignment)
-            if align_diff:
-                descs.append(f"对齐: {align_diff}")
-        if opts.get('number_format', True):
-            old_fmt = old_cell.number_format if old_cell.number_format is not None else 'General'
-            new_fmt = new_cell.number_format if new_cell.number_format is not None else 'General'
-            if old_fmt != new_fmt:
-                descs.append(f"数字格式: {old_fmt} → {new_fmt}")
-
-        if descs:
-            return {'type': '格式变化', 'desc': '; '.join(descs)}
         return None
 
     def _cmp_font(self, f1, f2):
@@ -750,15 +1025,15 @@ class OpenpyxlComparer:
         n1 = f1.name if f1.name is not None else ''
         n2 = f2.name if f2.name is not None else ''
         if n1 != n2:
-            changes.append(f"字体名: {n1 or '默认'}→{n2 or '默认'}")
-        s1 = f1.size if f1.size is not None else 0
-        s2 = f2.size if f2.size is not None else 0
+            changes.append(f"字体: {n1}→{n2}")
+        s1 = f1.size if f1.size is not None else 11
+        s2 = f2.size if f2.size is not None else 11
         if s1 != s2:
-            changes.append(f"大小: {s1}→{s2}")
+            changes.append(f"字号: {s1}→{s2}")
         b1 = f1.bold if f1.bold is not None else False
         b2 = f2.bold if f2.bold is not None else False
         if b1 != b2:
-            changes.append(f"粗体: {b1}→{b2}")
+            changes.append(f"加粗: {b1}→{b2}")
         i1 = f1.italic if f1.italic is not None else False
         i2 = f2.italic if f2.italic is not None else False
         if i1 != i2:
@@ -825,31 +1100,21 @@ class OpenpyxlComparer:
     def _compare_row_col_dimensions(self, old_ws, new_ws, sheet_name):
         opts = self.check_options
         if opts.get('row_height', True):
-            for row_idx, rd in old_ws.row_dimensions.items():
-                oh = rd.height
+            all_rows = set(old_ws.row_dimensions.keys()) | set(new_ws.row_dimensions.keys())
+            for row_idx in all_rows:
+                oh = old_ws.row_dimensions[row_idx].height if row_idx in old_ws.row_dimensions else None
                 nh = new_ws.row_dimensions[row_idx].height if row_idx in new_ws.row_dimensions else None
                 if oh != nh:
                     self.diffs.append({'sheet':sheet_name,'address':f"A{row_idx}",'type':'行高变化','desc':f'行高: {oh} → {nh}'})
-            for row_idx, rd in new_ws.row_dimensions.items():
-                if row_idx not in old_ws.row_dimensions:
-                    nh = rd.height
-                    if nh is not None:
-                        self.diffs.append({'sheet':sheet_name,'address':f"A{row_idx}",'type':'行高新设置','desc':f'行高: {nh}'})
         if opts.get('col_width', True):
-            for col_letter, cd in old_ws.column_dimensions.items():
-                ow = cd.width
+            all_cols = set(old_ws.column_dimensions.keys()) | set(new_ws.column_dimensions.keys())
+            for col_letter in all_cols:
+                ow = old_ws.column_dimensions[col_letter].width if col_letter in old_ws.column_dimensions else None
                 nw = new_ws.column_dimensions[col_letter].width if col_letter in new_ws.column_dimensions else None
                 if ow != nw:
                     col_idx = column_index_from_string(col_letter)
                     addr = cell_address(col_idx, 1)
                     self.diffs.append({'sheet':sheet_name,'address':addr,'type':'列宽变化','desc':f'列宽({col_letter}): {ow} → {nw}'})
-            for col_letter, cd in new_ws.column_dimensions.items():
-                if col_letter not in old_ws.column_dimensions:
-                    nw = cd.width
-                    if nw is not None:
-                        col_idx = column_index_from_string(col_letter)
-                        addr = cell_address(col_idx, 1)
-                        self.diffs.append({'sheet':sheet_name,'address':addr,'type':'列宽新设置','desc':f'列宽({col_letter}): {nw}'})
 
     def _get_images_from_ws(self, ws):
         images = []
@@ -863,7 +1128,7 @@ class OpenpyxlComparer:
                         addr = cell_address(col, row)
                         images.append((addr, img.width, img.height))
                 except Exception as e:
-                    self.log(f"图片提取异常: {e}")
+                    self._buf_log(f"图片提取异常: {e}")
         if images:
             return sorted(images, key=lambda x: x[0])
         if hasattr(ws, '_drawing') and ws._drawing:
@@ -995,14 +1260,14 @@ class CheckOptionsDialog(tb.Toplevel):
 class DiffViewer:
     def __init__(self, root):
         self.root = root
-        self.root.title("Excel 差异对比工具 v3.1")
+        self.root.title("Excel 差异对比工具 v3.2")
         self.root.geometry("1100x750")
 
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
         self.topmost = tk.BooleanVar(value=False)
         self.check_options = dict(DEFAULT_CHECK_OPTIONS)
-        self.plugin_manager = None  # v3.1
+        self.plugin_manager = None
         self.config_file = None
 
         # ========== 顶部工具栏 ==========
@@ -1019,7 +1284,6 @@ class DiffViewer:
         self.settings_btn = tb.Button(toolbar, text="⚙ 检测设置", bootstyle="outline", width=10, command=self.open_check_options)
         self.settings_btn.grid(row=0, column=2, rowspan=2, sticky='nsew', padx=2, pady=1)
 
-        # v3.1: 加载配置按钮
         self.config_btn = tb.Button(toolbar, text="📍 加载规则", bootstyle="outline", width=10, command=self.load_plugin_config)
         self.config_btn.grid(row=0, column=3, rowspan=2, sticky='nsew', padx=2, pady=1)
 
@@ -1104,14 +1368,13 @@ class DiffViewer:
             self.log(f"检测设置已更新：{enabled_count}/{total_count} 项已启用")
 
     def load_plugin_config(self):
-        """v3.1: 加载插件配置文件"""
         filepath = filedialog.askopenfilename(
             title="选择检查规则配置文件",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
         )
         if not filepath:
             return
-        
+
         self.plugin_manager = PluginManager(filepath)
         if self.plugin_manager.load_config(filepath):
             self.config_file = filepath
@@ -1124,18 +1387,31 @@ class DiffViewer:
             self.plugin_manager = None
 
     def log(self, msg):
-        self.log_text.insert('end', f"{time.strftime('%H:%M:%S')} {msg}\n")
+        self.log_text.insert('end', f"{msg}\n")
         self.log_text.see('end')
         self.root.update_idletasks()
 
     def update_progress(self, val, stat=""):
-        self.progress['value'] = val
-        if stat: self.log(stat)
+        def _update():
+            self.progress['value'] = val
+        self.root.after(0, _update)
+
+    def set_progress_mode(self, mode):
+        """切换进度条模式：determinate(百分比) 或 indeterminate(动画)"""
+        def _switch():
+            self.progress.configure(mode=mode)
+            if mode == 'indeterminate':
+                self.progress.start(15)
+            else:
+                self.progress.stop()
+        self.root.after(0, _switch)
 
     def start_compare(self):
         old = self.old_path.get(); new = self.new_path.get()
         if not old or not new:
             messagebox.showerror("错误","请选择两个文件"); return
+        if not os.path.isfile(old) or not os.path.isfile(new):
+            messagebox.showerror("错误","文件不存在"); return
         self.start_btn.configure(state='disabled')
         self.tree.delete(*self.tree.get_children())
         self.detail.delete('1.0','end')
@@ -1147,12 +1423,15 @@ class DiffViewer:
         def worker():
             try:
                 comparer = OpenpyxlComparer(old, new, self.log, self.update_progress,
-                                           check_options=current_opts, plugin_manager=pm)
+                                           check_options=current_opts, plugin_manager=pm,
+                                           progress_mode_fn=self.set_progress_mode)
                 comparer.run()
                 self.result_data = (comparer.diffs, comparer.sheet_diffs, comparer.stats)
                 self.root.after(0, self.populate_tree)
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("对比失败", str(e)))
+                import traceback
+                tb_str = traceback.format_exc()
+                self.root.after(0, lambda: messagebox.showerror("对比失败", f"{str(e)}\n\n{tb_str}"))
             finally:
                 self.root.after(0, self.on_comparison_finished)
 
@@ -1169,17 +1448,16 @@ class DiffViewer:
             for sd in sheet_diffs:
                 node = self.tree.insert(sn,'end',text=sd['desc'],values=(sd['name'],sd['type']))
                 self.diff_items.append((node, {'type':'sheet_struct','data':sd}))
-        
-        # v3.1: 插件检查结果单独分组
+
         plugin_diffs = [d for d in diffs if d['sheet'] == '🔍 数据检查']
         normal_diffs = [d for d in diffs if d['sheet'] != '🔍 数据检查']
-        
+
         if plugin_diffs:
             pn = self.tree.insert('','end',text='🔍 数据检查结果',open=True)
             for d in plugin_diffs:
                 node = self.tree.insert(pn,'end',text=d['desc'][:80],values=(d['address'],d['type']))
                 self.diff_items.append((node, {'type':'cell','data':d}))
-        
+
         dmap = {}
         for d in normal_diffs:
             dmap.setdefault(d['sheet'],[]).append(d)
@@ -1188,7 +1466,7 @@ class DiffViewer:
             for d in items:
                 node = self.tree.insert(pn,'end',text=d['desc'][:80],values=(d['address'],d['type']))
                 self.diff_items.append((node, {'type':'cell','data':d}))
-        
+
         self.jump_btn.configure(state='normal')
         enabled = sum(1 for v in self.check_options.values() if v)
         total = len(self.check_options)
@@ -1220,7 +1498,6 @@ class DiffViewer:
         else:
             return
 
-        # 插件检查结果不支持跳转
         if sheet == '🔍 数据检查':
             self.log("数据检查结果不支持跳转")
             return
