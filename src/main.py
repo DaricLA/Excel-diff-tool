@@ -1,5 +1,9 @@
 """
-Excel 报告检查工具 v3.10 - 修复增强版（完整）
+Excel 报告检查工具 v3.11 - 全面修复版
+1. 修复字体误报（忽略默认主题字体）
+2. 修复加载进度条无动画
+3. 规则编辑器支持读取 Sheet 列表（路径为空提示）
+4. 常规差异对比后自动执行进阶规则过滤，通过项折叠
 """
 import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
@@ -497,7 +501,6 @@ class DataLocator:
         if start_row < 1 or start_col < 1:
             return {'error': 'Target out of range'}
 
-        # 构建排除集合
         exclude_set = set()
         for ex in exclude:
             if isinstance(ex, str):
@@ -767,37 +770,6 @@ class OpenpyxlComparer:
         self._log_buffer = []
         self._last_gui_update = 0
 
-    def _with_heartbeat(self, label, fn):
-        stop_event = threading.Event()
-        t0 = time.time()
-        def _heartbeat():
-            while not stop_event.is_set():
-                stop_event.wait(3.0)
-                if stop_event.is_set():
-                    break
-                elapsed = time.time() - t0
-                try:
-                    self._buf_log(f"⏳ {label}... 已耗时 {elapsed:.0f}s")
-                    self._flush_log(force=True)
-                except:
-                    pass
-        hb = threading.Thread(target=_heartbeat, daemon=True)
-        self.progress_mode('indeterminate')
-        hb.start()
-        try:
-            result = fn()
-        finally:
-            stop_event.set()
-            hb.join(timeout=2)
-            self.progress_mode('determinate')
-        return result
-
-    def _load_rich_text(self):
-        self.old_rich = parse_rich_text_from_xlsx(self.old_path)
-        self.new_rich = parse_rich_text_from_xlsx(self.new_path)
-        self._buf_log(f"富文本解析完成：旧版 {sum(len(v) for v in self.old_rich.values())} 个，"
-                      f"新版 {sum(len(v) for v in self.new_rich.values())} 个")
-
     def _flush_log(self, force=False):
         now = time.time()
         if not force and (now - self._last_gui_update) < 0.15:
@@ -820,10 +792,8 @@ class OpenpyxlComparer:
         old_wb, new_wb = self._load_workbooks()
         if not old_wb or not new_wb:
             return False
-        if self.mode == 'diff':
-            self._run_diff_mode(old_wb, new_wb)
-        else:
-            self._run_rule_mode(old_wb, new_wb)
+        # 统一执行常规差异（若加载了检查项目，将在 _run_diff_mode 末尾自动执行规则过滤）
+        self._run_diff_mode(old_wb, new_wb)
         self.progress(95, "生成报告...")
         self._flush_log(force=True)
         total_time = time.time() - start_time
@@ -834,6 +804,8 @@ class OpenpyxlComparer:
 
     def _load_workbooks(self):
         try:
+            # 显示加载动画
+            self.progress_mode('indeterminate')
             self.progress(5, "正在加载旧版文件...")
             self._flush_log(force=True)
             old_wb = load_workbook(self.old_path, data_only=False)
@@ -847,11 +819,18 @@ class OpenpyxlComparer:
 
             # 加载富文本
             self.progress(20, "解析富文本...")
-            self._with_heartbeat("解析富文本", self._load_rich_text)
+            self._buf_log("开始解析富文本...")
+            self._flush_log(force=True)
+            self.old_rich = parse_rich_text_from_xlsx(self.old_path)
+            self.new_rich = parse_rich_text_from_xlsx(self.new_path)
+            self._buf_log(f"富文本解析完成：旧版 {sum(len(v) for v in self.old_rich.values())} 个，新版 {sum(len(v) for v in self.new_rich.values())} 个")
             self._flush_log(force=True)
 
+            # 切回确定进度
+            self.progress_mode('determinate')
             return old_wb, new_wb
         except Exception as e:
+            self.progress_mode('determinate')
             self._buf_log(f"加载工作簿失败: {e}")
             return None, None
 
@@ -882,255 +861,59 @@ class OpenpyxlComparer:
                     'type': diff['type'],
                     'desc': diff['desc']
                 })
-        # 进阶规则后置过滤
+        # 进阶规则后置过滤（如果加载了规则项目）
         if self.check_project:
             self.progress(90, "执行进阶规则过滤...")
             self._apply_rule_filter(self.diffs, old_wb, new_wb)
 
-    def _run_rule_mode(self, old_wb, new_wb):
-        if self.check_project:
-            total_rules = len(self.check_project.rules)
-            self._buf_log(f"正在执行检查项目规则：共 {total_rules} 条规则")
-            self._flush_log(force=True)
-            for idx, rule in enumerate(self.check_project.rules):
-                if self.stop_event.is_set():
-                    self._buf_log("用户请求停止，已跳过剩余规则")
-                    self._flush_log(force=True)
-                    raise KeyboardInterrupt
-                pct = 30 + int(60 * (idx / max(total_rules, 1)))
-                self.progress(pct, f"正在执行规则: {rule.rule_name}")
-                self._buf_log(f"正在执行规则: {rule.rule_name}")
-                self._flush_log(force=True)
-                self._run_single_rule(rule, old_wb, new_wb)
-            self.progress(95, "规则执行完成")
-            self._flush_log(force=True)
-        else:
-            self._buf_log("未加载检查项目，无法执行规则检查")
-            self.progress(95, "规则执行完成")
-            self._flush_log(force=True)
-
-    def _run_single_rule(self, rule, old_wb, new_wb):
-        if not rule.data_source:
+    def _apply_rule_filter(self, diffs, old_wb, new_wb):
+        if not diffs:
             return
-        old_locator = DataLocator()
-        old_locator.rules = [rule.data_source]
-        old_data_list = old_locator.locate_all(old_wb)
-        rule_name = rule.data_source.get('name', rule.rule_name)
-        old_data = old_data_list.get(rule_name)
-        if old_data is None:
-            old_data = old_data_list.get('', None)
-        new_locator = DataLocator()
-        new_locator.rules = [rule.data_source]
-        new_data_list = new_locator.locate_all(new_wb)
-        new_data = new_data_list.get(rule_name)
-        if new_data is None:
-            new_data = new_data_list.get('', None)
-        if old_data is None or new_data is None:
-            self._buf_log(f"规则 [{rule.rule_name}] 数据源定位失败，跳过")
-            return
+        diff_map = {}
+        for d in diffs:
+            key = (d['sheet'], d['address'])
+            diff_map.setdefault(key, []).append(d)
 
-        if isinstance(old_data, dict) and 'error' in old_data:
-            self._buf_log(f"规则 [{rule.rule_name}] 旧版数据源错误: {old_data['error']}")
-            return
-        if isinstance(new_data, dict) and 'error' in new_data:
-            self._buf_log(f"规则 [{rule.rule_name}] 新版数据源错误: {new_data['error']}")
-            return
-
-        address = None
-        if isinstance(old_data, dict) and 'addresses' in old_data:
-            address = old_data['addresses']
-        elif isinstance(old_data, dict) and 'address' in old_data:
-            address = old_data['address']
-        if not address:
-            self._buf_log(f"规则 [{rule.rule_name}] 无法获取地址，跳过")
-            return
-
-        sheet_name = rule.data_source.get('sheet', '')
-        if sheet_name not in old_wb.sheetnames or sheet_name not in new_wb.sheetnames:
-            self._buf_log(f"规则 [{rule.rule_name}] sheet不存在，跳过")
-            return
-
-        old_ws = old_wb[sheet_name]
-        new_ws = new_wb[sheet_name]
-
-        if isinstance(address, list):
-            for addr in address:
-                self._check_single_cell(rule, old_ws, new_ws, addr, sheet_name)
-        else:
-            self._check_single_cell(rule, old_ws, new_ws, address, sheet_name)
-
-    def _check_single_cell(self, rule, old_ws, new_ws, addr, sheet_name):
-        col_str = ''.join(ch for ch in addr if ch.isalpha())
-        row_str = ''.join(ch for ch in addr if ch.isdigit())
-        if not col_str or not row_str:
-            return
-        col_idx = column_index_from_string(col_str)
-        row_idx = int(row_str)
-        old_cell = old_ws.cell(row=row_idx, column=col_idx)
-        new_cell = new_ws.cell(row=row_idx, column=col_idx)
-        for check in rule.checks:
-            if not check.enabled:
+        for rule in self.check_project.rules:
+            ds = rule.data_source
+            sheet = ds.get('sheet', '')
+            if sheet not in old_wb.sheetnames or sheet not in new_wb.sheetnames:
                 continue
-            diff = self._compare_by_check_type(check.check_type, old_cell, new_cell, check.options,
-                                               old_ws, new_ws, addr, sheet_name)
-            if check.expect == 'same' and diff is not None:
-                self.diffs.append({
-                    'sheet': sheet_name,
-                    'address': addr,
-                    'type': f"规则检查-{check.check_type}",
-                    'desc': diff,
-                    'severity': 'error'
-                })
-                self.stats['diff_cells'] += 1
-            elif check.expect == 'different' and diff is None:
-                self.diffs.append({
-                    'sheet': sheet_name,
-                    'address': addr,
-                    'type': f"规则检查-{check.check_type}",
-                    'desc': "预期存在差异，但实际相同",
-                    'severity': 'warning'
-                })
-
-    def _compare_by_check_type(self, check_type, old_cell, new_cell, options=None,
-                               old_ws=None, new_ws=None, address=None, sheet_name=''):
-        if check_type == 'value':
-            old_val = old_cell.value
-            new_val = new_cell.value
-            if old_val != new_val:
-                return f"{old_val} → {new_val}"
-            return None
-        elif check_type == 'formula':
-            old_formula = old_cell.value if isinstance(old_cell.value, str) and old_cell.value.startswith('=') else None
-            new_formula = new_cell.value if isinstance(new_cell.value, str) and new_cell.value.startswith('=') else None
-            if old_formula != new_formula:
-                return f"公式: {old_formula} → {new_formula}"
-            return None
-        elif check_type == 'rich_text':
-            if old_ws is not None and new_ws is not None:
-                old_rich = self.old_rich.get(sheet_name, {}).get(address)
-                new_rich = self.new_rich.get(sheet_name, {}).get(address)
-                return compare_rich_text_runs(old_rich, new_rich)
-            return None
-        elif check_type == 'font':
-            return self._cmp_font(old_cell.font, new_cell.font)
-        elif check_type == 'fill':
-            return self._cmp_fill(old_cell.fill, new_cell.fill)
-        elif check_type == 'border':
-            return self._cmp_border(old_cell.border, new_cell.border)
-        elif check_type == 'alignment':
-            return self._cmp_alignment(old_cell.alignment, new_cell.alignment)
-        elif check_type == 'number_format':
-            nf1 = old_cell.number_format if old_cell.number_format is not None else 'General'
-            nf2 = new_cell.number_format if new_cell.number_format is not None else 'General'
-            if nf1.strip().lower() != nf2.strip().lower():
-                return f"{nf1} → {nf2}"
-            return None
-        elif check_type == 'merged_cells':
-            old_merged = str(old_cell.coordinate) if any(str(old_cell.coordinate) in str(m) for m in old_ws.merged_cells.ranges) else None
-            new_merged = str(new_cell.coordinate) if any(str(new_cell.coordinate) in str(m) for m in new_ws.merged_cells.ranges) else None
-            if old_merged != new_merged:
-                return f"合并区域: {old_merged} → {new_merged}"
-            return None
-        elif check_type == 'row_height':
-            old_height = old_ws.row_dimensions[old_cell.row].height if old_cell.row in old_ws.row_dimensions else None
-            new_height = new_ws.row_dimensions[new_cell.row].height if new_cell.row in new_ws.row_dimensions else None
-            if old_height != new_height:
-                return f"行高: {old_height} → {new_height}"
-            return None
-        elif check_type == 'col_width':
-            col_letter = get_column_letter(old_cell.column)
-            old_width = old_ws.column_dimensions[col_letter].width if col_letter in old_ws.column_dimensions else None
-            new_width = new_ws.column_dimensions[col_letter].width if col_letter in new_ws.column_dimensions else None
-            if old_width != new_width:
-                return f"列宽({col_letter}): {old_width} → {new_width}"
-            return None
-        elif check_type == 'images':
-            old_imgs = self._get_images_from_ws(old_ws)
-            new_imgs = self._get_images_from_ws(new_ws)
-            old_has = any(addr == address for addr, _, _ in old_imgs)
-            new_has = any(addr == address for addr, _, _ in new_imgs)
-            if old_has != new_has:
-                return f"图片存在: {old_has} → {new_has}"
-            return None
-        elif check_type == 'conditional_format':
-            old_cf = self._get_conditional_format_for_cell(old_ws, address)
-            new_cf = self._get_conditional_format_for_cell(new_ws, address)
-            if old_cf != new_cf:
-                return f"条件格式: {old_cf} → {new_cf}"
-            return None
-        return None
-
-    def _get_conditional_format_for_cell(self, ws, address):
-        for cf in ws.conditional_formatting:
-            if address in str(cf.sqref):
-                return str(cf.rules)
-        return None
-
-    def _compare_sheets(self, old_wb, new_wb):
-        old_names = set(old_wb.sheetnames)
-        new_names = set(new_wb.sheetnames)
-        for name in sorted(new_names - old_names, key=lambda n: list(new_names).index(n)):
-            self.sheet_diffs.append({'name': name, 'type': '新增', 'desc': f'新版新增 Sheet: {name}'})
-        for name in sorted(old_names - new_names, key=lambda n: list(old_names).index(n)):
-            self.sheet_diffs.append({'name': name, 'type': '删除', 'desc': f'旧版有但新版无: {name}'})
-        if self.sheet_diffs:
-            self._buf_log(f"Sheet结构: {len([s for s in self.sheet_diffs if s['type']=='新增'])} 新增, "
-                          f"{len([s for s in self.sheet_diffs if s['type']=='删除'])} 删除")
-
-    def _row_has_data(self, ws, row_idx, max_col_check):
-        for c in range(1, max_col_check + 1):
-            cell = ws.cell(row=row_idx, column=c)
-            if cell.value is not None:
-                return True
-        return False
-
-    def _col_has_data(self, ws, col_idx, max_row_check):
-        for r in range(1, max_row_check + 1):
-            cell = ws.cell(row=r, column=col_idx)
-            if cell.value is not None:
-                return True
-        return False
-
-    def _real_data_range(self, ws):
-        max_row = ws.max_row or 0
-        max_col = ws.max_column or 0
-        if max_row == 0 or max_col == 0:
-            return 0, 0, 1, 1
-        if max_row <= 50000 and max_col <= 200:
-            return 1, 1, max_row, max_col
-        check_cols = min(max_col, 500)
-        lo, hi = 1, max_row
-        real_max_row = 1
-        if max_row > 100000 and not self._row_has_data(ws, 100000, check_cols):
-            hi = 100000
-        if hi > 20000 and not self._row_has_data(ws, 20000, check_cols):
-            hi = 20000
-        if hi > 5000 and not self._row_has_data(ws, 5000, check_cols):
-            hi = 5000
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if self._row_has_data(ws, mid, check_cols):
-                real_max_row = mid
-                lo = mid + 1
+            locator = DataLocator()
+            locator.rules = [ds]
+            old_data = locator.locate_all(old_wb).get(ds.get('name', ''))
+            new_data = locator.locate_all(new_wb).get(ds.get('name', ''))
+            if not old_data or not new_data:
+                continue
+            if 'addresses' in old_data:
+                addresses = old_data['addresses']
+            elif 'address' in old_data:
+                addresses = [old_data['address']]
             else:
-                hi = mid - 1
-        check_rows = min(real_max_row, 500)
-        col_upper = min(max_col, 500)
-        if col_upper > 200 and not self._col_has_data(ws, 200, check_rows):
-            col_upper = 200
-        if col_upper > 50 and not self._col_has_data(ws, 50, check_rows):
-            col_upper = 50
-        real_max_col = 1
-        lo, hi = 1, col_upper
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if self._col_has_data(ws, mid, check_rows):
-                real_max_col = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        self._buf_log(f" [范围裁切] openpyxl报告 {max_row}行x{max_col}列 → 实际 {real_max_row}行x{real_max_col}列")
-        return 1, 1, real_max_row, real_max_col
+                continue
+            for addr in addresses:
+                if (sheet, addr) not in diff_map:
+                    continue
+                old_ws = old_wb[sheet]
+                new_ws = new_wb[sheet]
+                old_cell = old_ws.cell(row=old_ws[addr].row, column=old_ws[addr].column)
+                new_cell = new_ws.cell(row=new_ws[addr].row, column=new_ws[addr].column)
+                rule_passed = True
+                for check in rule.checks:
+                    if not check.enabled:
+                        continue
+                    diff = self._compare_by_check_type(check.check_type, old_cell, new_cell, check.options,
+                                                       old_ws, new_ws, addr, sheet)
+                    if check.expect == 'same' and diff is not None:
+                        rule_passed = False
+                        break
+                    elif check.expect == 'different' and diff is None:
+                        rule_passed = False
+                        break
+                if rule_passed:
+                    for d in diff_map[(sheet, addr)]:
+                        d['rule_pass'] = True
+                        d['rule_name'] = rule.rule_name
 
     def _compare_worksheet(self, old_ws, new_ws, sheet_name):
         opts = self.check_options
@@ -1250,13 +1033,10 @@ class OpenpyxlComparer:
         # 合并单元格
         if opts.get('merged_cells', True):
             self._compare_merged_cells(old_ws, new_ws, sheet_name)
-        # 行列维度
         if opts.get('row_height', True) or opts.get('col_width', True):
             self._compare_row_col_dimensions(old_ws, new_ws, sheet_name)
-        # 图片
         if opts.get('images', True):
             self._compare_images(old_ws, new_ws, sheet_name)
-        # 条件格式
         if opts.get('conditional_format', True):
             self._compare_conditional_formats(old_ws, new_ws, sheet_name)
 
@@ -1290,40 +1070,45 @@ class OpenpyxlComparer:
 
     def _cmp_font(self, f1, f2):
         changes = []
-        # 字体名称：忽略主题默认字体差异
+        # 智能比较字体名称：忽略默认主题字体差异
         n1 = f1.name if f1.name is not None else None
         n2 = f2.name if f2.name is not None else None
+        t1 = getattr(f1, 'theme', None)
+        t2 = getattr(f2, 'theme', None)
         if n1 != n2:
-            # 如果一方为None（表示继承主题），且主题相同，忽略
-            if (n1 is None or n2 is None):
-                t1 = getattr(f1, 'theme', None)
-                t2 = getattr(f2, 'theme', None)
-                if t1 is None or t2 is None or t1 == t2:
-                    pass  # 忽略
-                else:
-                    changes.append(f"字体: {n1 or '默认'}→{n2 or '默认'}")
+            # 如果一方无显式name，且双方theme相同或都为None，则忽略
+            if (n1 is None or n2 is None) and (t1 is None or t2 is None or t1 == t2):
+                pass  # 忽略名称差异
+            # 如果双方都有显式name，但theme相同，也可能同字体
+            elif n1 is not None and n2 is not None and t1 is not None and t2 is not None and t1 == t2:
+                pass  # 忽略
             else:
-                changes.append(f"字体: {n1}→{n2}")
+                changes.append(f"字体: {n1 or '默认'}→{n2 or '默认'}")
+        # 字号
         s1 = f1.size if f1.size is not None else 11
         s2 = f2.size if f2.size is not None else 11
         if s1 != s2:
             changes.append(f"字号: {s1}→{s2}")
+        # 加粗
         b1 = f1.bold if f1.bold is not None else False
         b2 = f2.bold if f2.bold is not None else False
         if b1 != b2:
             changes.append(f"加粗: {b1}→{b2}")
+        # 斜体
         i1 = f1.italic if f1.italic is not None else False
         i2 = f2.italic if f2.italic is not None else False
         if i1 != i2:
             changes.append(f"斜体: {i1}→{i2}")
+        # 下划线
         u1 = f1.underline if f1.underline is not None else False
         u2 = f2.underline if f2.underline is not None else False
         if u1 != u2:
             changes.append(f"下划线: {u1}→{u2}")
+        # 颜色
         c1 = normalize_color_for_compare(f1.color)
         c2 = normalize_color_for_compare(f2.color)
         if c1 != c2:
-            # 如果都是主题色且主题相同，忽略
+            # 如果都是主题色且相同，忽略
             if not (isinstance(c1, tuple) and isinstance(c2, tuple) and c1[0] == 'theme' and c1 == c2):
                 changes.append(f"颜色: {rgb_to_hex(f1.color)}→{rgb_to_hex(f2.color)}")
         return '; '.join(changes) if changes else None
@@ -1502,62 +1287,146 @@ class OpenpyxlComparer:
                     start = rng.split(':')[0] if ':' in rng else rng
                     self.diffs.append({'sheet': sheet_name, 'address': start, 'type': '条件格式修改', 'desc': f'条件格式规则变化，范围: {rng}'})
 
-    def _apply_rule_filter(self, diffs, old_wb, new_wb):
-        """对规则覆盖的差异项进行二次检查，通过则标记为Pass"""
-        if not diffs:
-            return
-        # 构建地址到差异项的映射
-        diff_map = {}
-        for d in diffs:
-            key = (d['sheet'], d['address'])
-            diff_map.setdefault(key, []).append(d)
+    def _compare_by_check_type(self, check_type, old_cell, new_cell, options=None,
+                               old_ws=None, new_ws=None, address=None, sheet_name=''):
+        if check_type == 'value':
+            old_val = old_cell.value
+            new_val = new_cell.value
+            if old_val != new_val:
+                return f"{old_val} → {new_val}"
+            return None
+        elif check_type == 'formula':
+            old_formula = old_cell.value if isinstance(old_cell.value, str) and old_cell.value.startswith('=') else None
+            new_formula = new_cell.value if isinstance(new_cell.value, str) and new_cell.value.startswith('=') else None
+            if old_formula != new_formula:
+                return f"公式: {old_formula} → {new_formula}"
+            return None
+        elif check_type == 'rich_text':
+            if old_ws is not None and new_ws is not None:
+                old_rich = self.old_rich.get(sheet_name, {}).get(address)
+                new_rich = self.new_rich.get(sheet_name, {}).get(address)
+                return compare_rich_text_runs(old_rich, new_rich)
+            return None
+        elif check_type == 'font':
+            return self._cmp_font(old_cell.font, new_cell.font)
+        elif check_type == 'fill':
+            return self._cmp_fill(old_cell.fill, new_cell.fill)
+        elif check_type == 'border':
+            return self._cmp_border(old_cell.border, new_cell.border)
+        elif check_type == 'alignment':
+            return self._cmp_alignment(old_cell.alignment, new_cell.alignment)
+        elif check_type == 'number_format':
+            nf1 = old_cell.number_format if old_cell.number_format is not None else 'General'
+            nf2 = new_cell.number_format if new_cell.number_format is not None else 'General'
+            if nf1.strip().lower() != nf2.strip().lower():
+                return f"{nf1} → {nf2}"
+            return None
+        elif check_type == 'merged_cells':
+            old_merged = str(old_cell.coordinate) if any(str(old_cell.coordinate) in str(m) for m in old_ws.merged_cells.ranges) else None
+            new_merged = str(new_cell.coordinate) if any(str(new_cell.coordinate) in str(m) for m in new_ws.merged_cells.ranges) else None
+            if old_merged != new_merged:
+                return f"合并区域: {old_merged} → {new_merged}"
+            return None
+        elif check_type == 'row_height':
+            old_height = old_ws.row_dimensions[old_cell.row].height if old_cell.row in old_ws.row_dimensions else None
+            new_height = new_ws.row_dimensions[new_cell.row].height if new_cell.row in new_ws.row_dimensions else None
+            if old_height != new_height:
+                return f"行高: {old_height} → {new_height}"
+            return None
+        elif check_type == 'col_width':
+            col_letter = get_column_letter(old_cell.column)
+            old_width = old_ws.column_dimensions[col_letter].width if col_letter in old_ws.column_dimensions else None
+            new_width = new_ws.column_dimensions[col_letter].width if col_letter in new_ws.column_dimensions else None
+            if old_width != new_width:
+                return f"列宽({col_letter}): {old_width} → {new_width}"
+            return None
+        elif check_type == 'images':
+            old_imgs = self._get_images_from_ws(old_ws)
+            new_imgs = self._get_images_from_ws(new_ws)
+            old_has = any(addr == address for addr, _, _ in old_imgs)
+            new_has = any(addr == address for addr, _, _ in new_imgs)
+            if old_has != new_has:
+                return f"图片存在: {old_has} → {new_has}"
+            return None
+        elif check_type == 'conditional_format':
+            old_cf = self._get_conditional_format_for_cell(old_ws, address)
+            new_cf = self._get_conditional_format_for_cell(new_ws, address)
+            if old_cf != new_cf:
+                return f"条件格式: {old_cf} → {new_cf}"
+            return None
+        return None
 
-        # 遍历每条规则
-        for rule in self.check_project.rules:
-            ds = rule.data_source
-            sheet = ds.get('sheet', '')
-            if sheet not in old_wb.sheetnames or sheet not in new_wb.sheetnames:
-                continue
-            # 定位数据源
-            locator = DataLocator()
-            locator.rules = [ds]
-            old_data = locator.locate_all(old_wb).get(ds.get('name', ''))
-            new_data = locator.locate_all(new_wb).get(ds.get('name', ''))
-            if not old_data or not new_data:
-                continue
-            # 获取地址列表
-            if 'addresses' in old_data:
-                addresses = old_data['addresses']
-            elif 'address' in old_data:
-                addresses = [old_data['address']]
+    def _get_conditional_format_for_cell(self, ws, address):
+        for cf in ws.conditional_formatting:
+            if address in str(cf.sqref):
+                return str(cf.rules)
+        return None
+
+    def _compare_sheets(self, old_wb, new_wb):
+        old_names = set(old_wb.sheetnames)
+        new_names = set(new_wb.sheetnames)
+        for name in sorted(new_names - old_names, key=lambda n: list(new_names).index(n)):
+            self.sheet_diffs.append({'name': name, 'type': '新增', 'desc': f'新版新增 Sheet: {name}'})
+        for name in sorted(old_names - new_names, key=lambda n: list(old_names).index(n)):
+            self.sheet_diffs.append({'name': name, 'type': '删除', 'desc': f'旧版有但新版无: {name}'})
+        if self.sheet_diffs:
+            self._buf_log(f"Sheet结构: {len([s for s in self.sheet_diffs if s['type']=='新增'])} 新增, "
+                          f"{len([s for s in self.sheet_diffs if s['type']=='删除'])} 删除")
+
+    def _row_has_data(self, ws, row_idx, max_col_check):
+        for c in range(1, max_col_check + 1):
+            cell = ws.cell(row=row_idx, column=c)
+            if cell.value is not None:
+                return True
+        return False
+
+    def _col_has_data(self, ws, col_idx, max_row_check):
+        for r in range(1, max_row_check + 1):
+            cell = ws.cell(row=r, column=col_idx)
+            if cell.value is not None:
+                return True
+        return False
+
+    def _real_data_range(self, ws):
+        max_row = ws.max_row or 0
+        max_col = ws.max_column or 0
+        if max_row == 0 or max_col == 0:
+            return 0, 0, 1, 1
+        if max_row <= 50000 and max_col <= 200:
+            return 1, 1, max_row, max_col
+        check_cols = min(max_col, 500)
+        lo, hi = 1, max_row
+        real_max_row = 1
+        if max_row > 100000 and not self._row_has_data(ws, 100000, check_cols):
+            hi = 100000
+        if hi > 20000 and not self._row_has_data(ws, 20000, check_cols):
+            hi = 20000
+        if hi > 5000 and not self._row_has_data(ws, 5000, check_cols):
+            hi = 5000
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._row_has_data(ws, mid, check_cols):
+                real_max_row = mid
+                lo = mid + 1
             else:
-                continue
-            # 规则检查通过的条件：该地址上启用的检查项，期望均满足（无差异产生）
-            for addr in addresses:
-                # 该地址是否有差异？
-                if (sheet, addr) not in diff_map:
-                    continue
-                # 执行该单元格的规则检查
-                old_ws = old_wb[sheet]
-                new_ws = new_wb[sheet]
-                old_cell = old_ws.cell(row=old_ws[addr].row, column=old_ws[addr].column)
-                new_cell = new_ws.cell(row=new_ws[addr].row, column=new_ws[addr].column)
-                rule_passed = True
-                for check in rule.checks:
-                    if not check.enabled:
-                        continue
-                    diff = self._compare_by_check_type(check.check_type, old_cell, new_cell, check.options,
-                                                       old_ws, new_ws, addr, sheet)
-                    if check.expect == 'same' and diff is not None:
-                        rule_passed = False
-                        break
-                    elif check.expect == 'different' and diff is None:
-                        rule_passed = False
-                        break
-                if rule_passed:
-                    for d in diff_map[(sheet, addr)]:
-                        d['rule_pass'] = True
-                        d['rule_name'] = rule.rule_name
+                hi = mid - 1
+        check_rows = min(real_max_row, 500)
+        col_upper = min(max_col, 500)
+        if col_upper > 200 and not self._col_has_data(ws, 200, check_rows):
+            col_upper = 200
+        if col_upper > 50 and not self._col_has_data(ws, 50, check_rows):
+            col_upper = 50
+        real_max_col = 1
+        lo, hi = 1, col_upper
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._col_has_data(ws, mid, check_rows):
+                real_max_col = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        self._buf_log(f" [范围裁切] openpyxl报告 {max_row}行x{max_col}列 → 实际 {real_max_row}行x{real_max_col}列")
+        return 1, 1, real_max_row, real_max_col
 
 # ---------------------------- 检测项设置弹窗 ----------------------------
 class CheckOptionsDialog(tb.Toplevel):
@@ -2141,7 +2010,7 @@ class DiffViewer:
         dlg = CheckProjectDialog(self.root, old, new, self.check_project)
         if dlg.result is not None:
             self.check_project = dlg.result
-            self.start_btn.configure(text=f"规则检查\n（{self.check_project.project_name}）", width=16)
+            self.start_btn.configure(text=f"常规差异对比\n（含规则过滤）", width=16)
             self.settings_btn.configure(state='disabled')
             self.project_btn.configure(text="进阶检查规则")
             self.log(f"检查项目已加载：{self.check_project.project_name}，包含 {len(self.check_project.rules)} 条规则")
@@ -2171,7 +2040,7 @@ class DiffViewer:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             self.check_project = CheckProject.from_dict(data)
-            self.start_btn.configure(text=f"规则检查\n（{self.check_project.project_name}）", width=16)
+            self.start_btn.configure(text=f"常规差异对比\n（含规则过滤）", width=16)
             self.settings_btn.configure(state='disabled')
             self.config_btn.configure(text="退出规则模式", command=self.clear_check_project)
             self.log(f"检查项目已加载：{self.check_project.project_name}，包含 {len(self.check_project.rules)} 条规则")
@@ -2218,62 +2087,37 @@ class DiffViewer:
         self.detail.delete('1.0', 'end')
         self.diff_items = []
 
-        if self.check_project:
-            def worker():
-                comparer = None
-                try:
-                    comparer = OpenpyxlComparer(old, new, self.log, self.update_progress,
-                                                check_options=None, plugin_manager=None,
-                                                progress_mode_fn=self.set_progress_mode,
-                                                check_project=self.check_project,
-                                                stop_event=self.stop_event,
-                                                mode='rule')
-                    comparer.run()
+        # 始终执行常规差异对比；若加载了规则项目，则自动进行后置过滤
+        current_opts = dict(self.check_options)
+        pm = self.plugin_manager
+        cp = self.check_project
+
+        def worker():
+            comparer = None
+            try:
+                comparer = OpenpyxlComparer(old, new, self.log, self.update_progress,
+                                            check_options=current_opts, plugin_manager=pm,
+                                            progress_mode_fn=self.set_progress_mode,
+                                            check_project=cp,
+                                            stop_event=self.stop_event,
+                                            mode='diff')  # 统一为 diff 模式
+                comparer.run()
+                self.result_data = (comparer.diffs, comparer.sheet_diffs, comparer.stats)
+                self.root.after(0, self.populate_tree)
+            except KeyboardInterrupt:
+                if comparer:
                     self.result_data = (comparer.diffs, comparer.sheet_diffs, comparer.stats)
-                    self.root.after(0, self.populate_tree)
-                except KeyboardInterrupt:
-                    if comparer:
-                        self.result_data = (comparer.diffs, comparer.sheet_diffs, comparer.stats)
-                    else:
-                        self.result_data = ([], [], {'total_cells':0, 'diff_cells':0, 'added_sheets':[], 'removed_sheets':[], 'images_diff':0})
-                    self.root.after(0, self.populate_tree)
-                except Exception as e:
-                    import traceback
-                    tb_str = traceback.format_exc()
-                    error_msg = f"{str(e)}\n\n{tb_str}"
-                    self.root.after(0, lambda msg=error_msg: messagebox.showerror("对比失败", msg))
-                finally:
-                    self.root.after(0, self.on_comparison_finished)
-            threading.Thread(target=worker, daemon=True).start()
-        else:
-            current_opts = dict(self.check_options)
-            pm = self.plugin_manager
-            def worker():
-                comparer = None
-                try:
-                    comparer = OpenpyxlComparer(old, new, self.log, self.update_progress,
-                                                check_options=current_opts, plugin_manager=pm,
-                                                progress_mode_fn=self.set_progress_mode,
-                                                check_project=None,
-                                                stop_event=self.stop_event,
-                                                mode='diff')
-                    comparer.run()
-                    self.result_data = (comparer.diffs, comparer.sheet_diffs, comparer.stats)
-                    self.root.after(0, self.populate_tree)
-                except KeyboardInterrupt:
-                    if comparer:
-                        self.result_data = (comparer.diffs, comparer.sheet_diffs, comparer.stats)
-                    else:
-                        self.result_data = ([], [], {'total_cells':0, 'diff_cells':0, 'added_sheets':[], 'removed_sheets':[], 'images_diff':0})
-                    self.root.after(0, self.populate_tree)
-                except Exception as e:
-                    import traceback
-                    tb_str = traceback.format_exc()
-                    error_msg = f"{str(e)}\n\n{tb_str}"
-                    self.root.after(0, lambda msg=error_msg: messagebox.showerror("对比失败", msg))
-                finally:
-                    self.root.after(0, self.on_comparison_finished)
-            threading.Thread(target=worker, daemon=True).start()
+                else:
+                    self.result_data = ([], [], {'total_cells':0, 'diff_cells':0, 'added_sheets':[], 'removed_sheets':[], 'images_diff':0})
+                self.root.after(0, self.populate_tree)
+            except Exception as e:
+                import traceback
+                tb_str = traceback.format_exc()
+                error_msg = f"{str(e)}\n\n{tb_str}"
+                self.root.after(0, lambda msg=error_msg: messagebox.showerror("对比失败", msg))
+            finally:
+                self.root.after(0, self.on_comparison_finished)
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_comparison_finished(self):
         self.start_btn.configure(state='normal')
@@ -2284,7 +2128,6 @@ class DiffViewer:
 
     def populate_tree(self):
         diffs, sheet_diffs, stats = self.result_data
-        # 分组
         normal_diffs = []
         rule_pass_diffs = []
         plugin_diffs = []
@@ -2295,19 +2138,16 @@ class DiffViewer:
                 rule_pass_diffs.append(d)
             else:
                 normal_diffs.append(d)
-        # 显示Sheet结构差异
         if sheet_diffs:
             sn = self.tree.insert('', 'end', text='📋 Sheet 结构差异', open=True)
             for sd in sheet_diffs:
                 node = self.tree.insert(sn, 'end', text=sd['desc'], values=(sd['name'], sd['type']))
                 self.diff_items.append((node, {'type': 'sheet_struct', 'data': sd}))
-        # 插件差异
         if plugin_diffs:
             pn = self.tree.insert('', 'end', text='🔍 数据检查结果', open=True)
             for d in plugin_diffs:
                 node = self.tree.insert(pn, 'end', text=d['desc'][:80], values=(d['address'], d['type']))
                 self.diff_items.append((node, {'type': 'cell', 'data': d}))
-        # 常规差异
         dmap = {}
         for d in normal_diffs:
             dmap.setdefault(d['sheet'], []).append(d)
@@ -2316,7 +2156,6 @@ class DiffViewer:
             for d in items:
                 node = self.tree.insert(pn, 'end', text=d['desc'][:80], values=(d['address'], d['type']))
                 self.diff_items.append((node, {'type': 'cell', 'data': d}))
-        # 进阶规则Pass
         if rule_pass_diffs:
             pn = self.tree.insert('', 'end', text='✅ 进阶规则Pass（已折叠）', open=False)
             for d in rule_pass_diffs:
@@ -2325,7 +2164,7 @@ class DiffViewer:
         enabled = sum(1 for v in self.check_options.values() if v)
         total = len(self.check_options)
         plugin_info = f"，{len(plugin_diffs)} 个插件告警" if plugin_diffs else ""
-        self.log(f"树形列表已加载，单击查看详情，双击跳转（启用 {enabled}/{total} 项检测{plugin_info}，规则Pass {len(rule_pass_diffs)} 项）")
+        self.log(f"树形列表已加载，常规差异 {len(normal_diffs)} 项，规则Pass {len(rule_pass_diffs)} 项，插件 {len(plugin_diffs)} 项")
 
     def on_tree_select(self, event):
         sel = self.tree.selection()
