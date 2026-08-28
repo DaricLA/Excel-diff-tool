@@ -680,6 +680,7 @@ class OpenpyxlComparer:
     def _run_diff_mode(self, old_wb, new_wb):
         self._compare_sheets(old_wb, new_wb)
         total = len(old_wb.sheetnames)
+        start_time = time.time()
         for idx, sheet_name in enumerate(old_wb.sheetnames, 1):
             if self.stop_event.is_set():
                 self._buf_log(f"用户请求停止，已跳过剩余 {total - idx + 1} 个sheet")
@@ -690,6 +691,10 @@ class OpenpyxlComparer:
             self._flush_log(force=True)
             if sheet_name in new_wb.sheetnames:
                 self._compare_worksheet(old_wb[sheet_name], new_wb[sheet_name], sheet_name)
+            # 记录每个sheet完成后的耗时
+            elapsed = time.time() - start_time
+            self._buf_log(f"已完成 {sheet_name} ({idx}/{total})，累计耗时 {elapsed:.0f}s")
+            self._flush_log(force=True)
         if self.plugin_manager and self.plugin_manager.plugins:
             self.progress(85, "执行数据检查插件...")
             self._buf_log(f"执行 {len(self.plugin_manager.plugins)} 个检查插件...")
@@ -729,25 +734,37 @@ class OpenpyxlComparer:
             '单元格新增': 'value',
             '单元格删除': 'value'
         }
+        # 构建规则地址映射表（优化性能）
+        rule_addr_map = {}
+        for rule in self.check_project.rules:
+            ds = rule.data_source
+            sheet = ds.get('sheet', '')
+            if sheet not in old_wb.sheetnames or sheet not in new_wb.sheetnames:
+                continue
+            locator = DataLocator()
+            locator.rules = [ds]
+            old_data = locator.locate_all(old_wb).get(ds.get('name', ''))
+            new_data = locator.locate_all(new_wb).get(ds.get('name', ''))
+            if not old_data or not new_data:
+                continue
+            addresses = old_data.get('addresses') or [old_data.get('address')] if isinstance(old_data, dict) else None
+            if addresses:
+                for addr in addresses:
+                    rule_addr_map.setdefault((sheet, addr), []).append(rule)
+
+        # 遍历差异项，查表判断
         for d in diffs:
             if d['sheet'] == '🔍 数据检查':
                 continue
             check_type = diff_type_map.get(d['type'])
             if not check_type:
                 continue
-            for rule in self.check_project.rules:
+            key = (d['sheet'], d['address'])
+            if key not in rule_addr_map:
+                continue
+            for rule in rule_addr_map[key]:
                 ds = rule.data_source
-                if d['sheet'] != ds.get('sheet'):
-                    continue
-                locator = DataLocator()
-                locator.rules = [ds]
-                old_data = locator.locate_all(old_wb).get(ds.get('name', ''))
-                new_data = locator.locate_all(new_wb).get(ds.get('name', ''))
-                if not old_data or not new_data:
-                    continue
-                addresses = old_data.get('addresses') or [old_data.get('address')] if isinstance(old_data, dict) else None
-                if addresses is None or d['address'] not in addresses:
-                    continue
+                # 快速获取old/new单元格
                 old_ws = old_wb[d['sheet']]
                 new_ws = new_wb[d['sheet']]
                 col_str = ''.join(ch for ch in d['address'] if ch.isalpha())
@@ -769,6 +786,8 @@ class OpenpyxlComparer:
                             d['rule_pass'] = True
                             d['rule_name'] = rule.rule_name
                             break
+                if d.get('rule_pass'):
+                    break  # 如果已通过一个规则，不再检查其他规则
 
     def _compare_worksheet(self, old_ws, new_ws, sheet_name):
         opts = self.check_options
@@ -1235,20 +1254,21 @@ class CheckOptionsDialog(tb.Toplevel):
         self.vars = {}
         main_frame = tb.Frame(self, padding=15)
         main_frame.pack(fill='both', expand=True)
-        for group_name, keys in CHECK_OPTION_GROUPS:
+        # 三列布局
+        for col, (group_name, keys) in enumerate(CHECK_OPTION_GROUPS):
             lf = tb.Labelframe(main_frame, text=group_name, padding=(8, 5))
-            lf.pack(fill='x', pady=(0, 8))
-            row_frame = None
-            for i, key in enumerate(keys):
-                if i % 3 == 0:
-                    row_frame = tb.Frame(lf)
-                    row_frame.pack(fill='x', pady=1)
+            lf.grid(row=0, column=col, sticky='nsew', padx=5, pady=5)
+            # 垂直排列复选框
+            for key in keys:
                 var = tk.BooleanVar(value=current_options.get(key, True))
                 self.vars[key] = var
-                cb = tb.Checkbutton(row_frame, text=CHECK_OPTION_LABELS[key], variable=var, bootstyle="round-toggle")
-                cb.pack(side='left', padx=(0, 15))
+                cb = tb.Checkbutton(lf, text=CHECK_OPTION_LABELS[key], variable=var, bootstyle="round-toggle")
+                cb.pack(anchor='w', pady=2)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.columnconfigure(2, weight=1)
         btn_frame = tb.Frame(main_frame)
-        btn_frame.pack(fill='x', pady=(12, 0))
+        btn_frame.grid(row=1, column=0, columnspan=3, pady=(12, 0))
         tb.Button(btn_frame, text="全选", width=8, command=self._select_all).pack(side='left', padx=(0, 5))
         tb.Button(btn_frame, text="全不选", width=8, command=self._deselect_all).pack(side='left', padx=(0, 5))
         tb.Button(btn_frame, text="取消", width=8, command=self._on_cancel).pack(side='right', padx=(5, 0))
@@ -1829,7 +1849,7 @@ class DiffViewer:
         def _switch():
             self.progress.configure(mode=mode)
             if mode == 'indeterminate':
-                self.progress.start(15)
+                self.progress.start(50)  # 提高动画速度
             else:
                 self.progress.stop()
         self.root.after(0, _switch)
@@ -1852,6 +1872,11 @@ class DiffViewer:
         self.tree.delete(*self.tree.get_children())
         self.detail.delete('1.0', 'end')
         self.diff_items = []
+
+        # 添加日志分隔符
+        self.log("=" * 50)
+        self.log("开始新的检查")
+        self.log("=" * 50)
 
         current_opts = dict(self.check_options)
         pm = self.plugin_manager
