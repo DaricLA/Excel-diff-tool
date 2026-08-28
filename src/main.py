@@ -1,7 +1,5 @@
 """
-Excel 报告检查工具 v3.9 - 最终修复版
-包含所有确认功能：常规差异对比、规则检查模式、进度显示、退出规则模式、
-规则编辑器左右布局、双击跳转、13项检查、range模式等。
+Excel 报告检查工具 v3.10 - 修复增强版（完整）
 """
 import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
@@ -464,7 +462,6 @@ class DataLocator:
     def _locate_intersection(self, ws, rule):
         row_anchor_cfg = rule.get('row_anchor', {})
         col_anchor_cfg = rule.get('col_anchor', {})
-        # 默认在整个工作表查找，允许规则中覆盖 search_in
         row_anchor = self._find_anchor(ws, {**row_anchor_cfg, 'search_in': row_anchor_cfg.get('search_in', 'all')})
         col_anchor = self._find_anchor(ws, {**col_anchor_cfg, 'search_in': col_anchor_cfg.get('search_in', 'all')})
         if not row_anchor:
@@ -489,6 +486,7 @@ class DataLocator:
         col_offset = target.get('col_offset', 0)
         row_count = target.get('row_count', 1)
         col_count = target.get('col_count', 1)
+        exclude = target.get('exclude', [])
 
         anchor = self._find_anchor(ws, anchor_cfg)
         if not anchor:
@@ -499,6 +497,22 @@ class DataLocator:
         if start_row < 1 or start_col < 1:
             return {'error': 'Target out of range'}
 
+        # 构建排除集合
+        exclude_set = set()
+        for ex in exclude:
+            if isinstance(ex, str):
+                m = re.match(r'^([A-Z]+)(\d+)$', ex)
+                if m:
+                    col_letter = m.group(1)
+                    row = int(m.group(2))
+                    col = column_index_from_string(col_letter)
+                    exclude_set.add(f"{get_column_letter(col)}{row}")
+            elif isinstance(ex, list) and len(ex) == 2:
+                rel_r, rel_c = ex
+                abs_r = start_row + rel_r
+                abs_c = start_col + rel_c
+                exclude_set.add(cell_address(abs_c, abs_r))
+
         addresses = []
         values = []
         for r in range(start_row, start_row + row_count):
@@ -507,8 +521,10 @@ class DataLocator:
             for c in range(start_col, start_col + col_count):
                 if c > (ws.max_column or 1):
                     break
-                cell = ws.cell(row=r, column=c)
                 addr = cell_address(c, r)
+                if addr in exclude_set:
+                    continue
+                cell = ws.cell(row=r, column=c)
                 addresses.append(addr)
                 values.append(cell.value)
 
@@ -829,6 +845,11 @@ class OpenpyxlComparer:
             self._buf_log(f"新版加载完成: {len(new_wb.sheetnames)} 个sheet")
             self._flush_log(force=True)
 
+            # 加载富文本
+            self.progress(20, "解析富文本...")
+            self._with_heartbeat("解析富文本", self._load_rich_text)
+            self._flush_log(force=True)
+
             return old_wb, new_wb
         except Exception as e:
             self._buf_log(f"加载工作簿失败: {e}")
@@ -861,6 +882,10 @@ class OpenpyxlComparer:
                     'type': diff['type'],
                     'desc': diff['desc']
                 })
+        # 进阶规则后置过滤
+        if self.check_project:
+            self.progress(90, "执行进阶规则过滤...")
+            self._apply_rule_filter(self.diffs, old_wb, new_wb)
 
     def _run_rule_mode(self, old_wb, new_wb):
         if self.check_project:
@@ -904,7 +929,6 @@ class OpenpyxlComparer:
             self._buf_log(f"规则 [{rule.rule_name}] 数据源定位失败，跳过")
             return
 
-        # 检查 DataLocator 返回的错误信息
         if isinstance(old_data, dict) and 'error' in old_data:
             self._buf_log(f"规则 [{rule.rule_name}] 旧版数据源错误: {old_data['error']}")
             return
@@ -912,7 +936,6 @@ class OpenpyxlComparer:
             self._buf_log(f"规则 [{rule.rule_name}] 新版数据源错误: {new_data['error']}")
             return
 
-        # 修复：优先获取 addresses 列表（range 模式）
         address = None
         if isinstance(old_data, dict) and 'addresses' in old_data:
             address = old_data['addresses']
@@ -958,7 +981,7 @@ class OpenpyxlComparer:
                     'desc': diff,
                     'severity': 'error'
                 })
-                self.stats['diff_cells'] += 1  # 修复：更新统计
+                self.stats['diff_cells'] += 1
             elif check.expect == 'different' and diff is None:
                 self.diffs.append({
                     'sheet': sheet_name,
@@ -999,7 +1022,7 @@ class OpenpyxlComparer:
         elif check_type == 'number_format':
             nf1 = old_cell.number_format if old_cell.number_format is not None else 'General'
             nf2 = new_cell.number_format if new_cell.number_format is not None else 'General'
-            if nf1 != nf2:
+            if nf1.strip().lower() != nf2.strip().lower():
                 return f"{nf1} → {nf2}"
             return None
         elif check_type == 'merged_cells':
@@ -1169,27 +1192,22 @@ class OpenpyxlComparer:
                 if old_v is None and new_v is None:
                     if not (check_font or check_fill or check_border or check_align or check_nf):
                         continue
-                # 值检查（如果启用）
+                # 值检查
                 if check_value:
                     val_diff = self._get_cell_diff(old_cell, new_cell)
                     if val_diff:
                         self.diffs.append({'sheet': sheet_name, 'address': addr, 'type': '内容变化', 'desc': val_diff})
                         self.stats['diff_cells'] += 1
-                        # 值不同时，后续其他格式检查仍然执行，但跳过公式独立检查？
-                        # 原逻辑是continue，表示如果值有差异，跳过格式检查？原代码continue，但可能导致格式差异丢失。
-                        # 我们保持原逻辑，不改变（原代码是continue，跳过后续格式检查）。如果觉得不合理，可调整。
-                        # 这里我们保留原行为，因为用户未提出修改。
                         continue
-                # 修复：公式独立检查（当值检查未启用时）
+                # 公式独立检查（当值检查未启用时）
                 if check_formula and not check_value:
                     old_formula = old_cell.value if isinstance(old_cell.value, str) and old_cell.value.startswith('=') else None
                     new_formula = new_cell.value if isinstance(new_cell.value, str) and new_cell.value.startswith('=') else None
                     if old_formula != new_formula:
-                        diff = f"公式: {old_formula} → {new_formula}"
-                        self.diffs.append({'sheet': sheet_name, 'address': addr, 'type': '公式变化', 'desc': diff})
+                        self.diffs.append({'sheet': sheet_name, 'address': addr, 'type': '公式变化', 'desc': f"公式: {old_formula} → {new_formula}"})
                         self.stats['diff_cells'] += 1
                         continue
-                # 格式检查（如果值检查通过或未启用）
+                # 格式检查
                 if check_font:
                     fdiff = self._cmp_font(old_cell.font, new_cell.font)
                     if fdiff:
@@ -1209,7 +1227,7 @@ class OpenpyxlComparer:
                 if check_nf:
                     nf1 = old_cell.number_format if old_cell.number_format is not None else 'General'
                     nf2 = new_cell.number_format if new_cell.number_format is not None else 'General'
-                    if nf1 != nf2:
+                    if nf1.strip().lower() != nf2.strip().lower():
                         self.diffs.append({'sheet': sheet_name, 'address': addr, 'type': '数字格式变化', 'desc': f'{nf1} → {nf2}'})
                 row_count += 1
                 if row_count % batch_size == 0:
@@ -1272,10 +1290,20 @@ class OpenpyxlComparer:
 
     def _cmp_font(self, f1, f2):
         changes = []
-        n1 = f1.name if f1.name is not None else ''
-        n2 = f2.name if f2.name is not None else ''
+        # 字体名称：忽略主题默认字体差异
+        n1 = f1.name if f1.name is not None else None
+        n2 = f2.name if f2.name is not None else None
         if n1 != n2:
-            changes.append(f"字体: {n1}→{n2}")
+            # 如果一方为None（表示继承主题），且主题相同，忽略
+            if (n1 is None or n2 is None):
+                t1 = getattr(f1, 'theme', None)
+                t2 = getattr(f2, 'theme', None)
+                if t1 is None or t2 is None or t1 == t2:
+                    pass  # 忽略
+                else:
+                    changes.append(f"字体: {n1 or '默认'}→{n2 or '默认'}")
+            else:
+                changes.append(f"字体: {n1}→{n2}")
         s1 = f1.size if f1.size is not None else 11
         s2 = f2.size if f2.size is not None else 11
         if s1 != s2:
@@ -1295,7 +1323,9 @@ class OpenpyxlComparer:
         c1 = normalize_color_for_compare(f1.color)
         c2 = normalize_color_for_compare(f2.color)
         if c1 != c2:
-            changes.append(f"颜色: {rgb_to_hex(f1.color)}→{rgb_to_hex(f2.color)}")
+            # 如果都是主题色且主题相同，忽略
+            if not (isinstance(c1, tuple) and isinstance(c2, tuple) and c1[0] == 'theme' and c1 == c2):
+                changes.append(f"颜色: {rgb_to_hex(f1.color)}→{rgb_to_hex(f2.color)}")
         return '; '.join(changes) if changes else None
 
     def _cmp_fill(self, f1, f2):
@@ -1312,6 +1342,17 @@ class OpenpyxlComparer:
 
     def _cmp_border(self, b1, b2):
         parts = []
+        side_names = {'left': '左', 'right': '右', 'top': '上', 'bottom': '下'}
+        style_names = {
+            'thin': '细线', 'medium': '中等线', 'dashed': '虚线', 'dotted': '点线',
+            'double': '双线', 'thick': '粗线', 'dashDot': '点划线', 'dashDotDot': '双点划线',
+            'slantDashDot': '斜点划线', 'mediumDashed': '中等虚线', 'mediumDashDot': '中等点划线',
+            'mediumDashDotDot': '中等双点划线', 'hair': '发丝线'
+        }
+        color_names = {
+            'FF000000': '黑色', 'FFFFFFFF': '白色', 'FFFF0000': '红色', 'FF00FF00': '绿色',
+            'FF0000FF': '蓝色', 'FFFFFF00': '黄色', 'FFFF00FF': '品红', 'FF00FFFF': '青色'
+        }
         for side in ['left', 'right', 'top', 'bottom']:
             s1 = getattr(b1, side)
             s2 = getattr(b2, side)
@@ -1320,7 +1361,19 @@ class OpenpyxlComparer:
             c1 = normalize_color_for_compare(s1.color)
             c2 = normalize_color_for_compare(s2.color)
             if st1 != st2 or c1 != c2:
-                parts.append(f"{side}: {s1.style}/{rgb_to_hex(s1.color)}→{s2.style}/{rgb_to_hex(s2.color)}")
+                def color_desc(ci):
+                    if ci is None:
+                        return '无'
+                    if isinstance(ci, tuple):
+                        if ci[0] == 'rgb':
+                            hexcode = ci[1]
+                            return color_names.get(hexcode, f"#{hexcode}")
+                        else:
+                            return str(ci)
+                    return str(ci)
+                def style_desc(st):
+                    return style_names.get(st, st or '无')
+                parts.append(f"{side_names[side]}: {style_desc(st1)}/{color_desc(c1)}→{style_desc(st2)}/{color_desc(c2)}")
         return '; '.join(parts) if parts else None
 
     def _cmp_alignment(self, a1, a2):
@@ -1448,6 +1501,63 @@ class OpenpyxlComparer:
                 if old_rules != new_rules:
                     start = rng.split(':')[0] if ':' in rng else rng
                     self.diffs.append({'sheet': sheet_name, 'address': start, 'type': '条件格式修改', 'desc': f'条件格式规则变化，范围: {rng}'})
+
+    def _apply_rule_filter(self, diffs, old_wb, new_wb):
+        """对规则覆盖的差异项进行二次检查，通过则标记为Pass"""
+        if not diffs:
+            return
+        # 构建地址到差异项的映射
+        diff_map = {}
+        for d in diffs:
+            key = (d['sheet'], d['address'])
+            diff_map.setdefault(key, []).append(d)
+
+        # 遍历每条规则
+        for rule in self.check_project.rules:
+            ds = rule.data_source
+            sheet = ds.get('sheet', '')
+            if sheet not in old_wb.sheetnames or sheet not in new_wb.sheetnames:
+                continue
+            # 定位数据源
+            locator = DataLocator()
+            locator.rules = [ds]
+            old_data = locator.locate_all(old_wb).get(ds.get('name', ''))
+            new_data = locator.locate_all(new_wb).get(ds.get('name', ''))
+            if not old_data or not new_data:
+                continue
+            # 获取地址列表
+            if 'addresses' in old_data:
+                addresses = old_data['addresses']
+            elif 'address' in old_data:
+                addresses = [old_data['address']]
+            else:
+                continue
+            # 规则检查通过的条件：该地址上启用的检查项，期望均满足（无差异产生）
+            for addr in addresses:
+                # 该地址是否有差异？
+                if (sheet, addr) not in diff_map:
+                    continue
+                # 执行该单元格的规则检查
+                old_ws = old_wb[sheet]
+                new_ws = new_wb[sheet]
+                old_cell = old_ws.cell(row=old_ws[addr].row, column=old_ws[addr].column)
+                new_cell = new_ws.cell(row=new_ws[addr].row, column=new_ws[addr].column)
+                rule_passed = True
+                for check in rule.checks:
+                    if not check.enabled:
+                        continue
+                    diff = self._compare_by_check_type(check.check_type, old_cell, new_cell, check.options,
+                                                       old_ws, new_ws, addr, sheet)
+                    if check.expect == 'same' and diff is not None:
+                        rule_passed = False
+                        break
+                    elif check.expect == 'different' and diff is None:
+                        rule_passed = False
+                        break
+                if rule_passed:
+                    for d in diff_map[(sheet, addr)]:
+                        d['rule_pass'] = True
+                        d['rule_name'] = rule.rule_name
 
 # ---------------------------- 检测项设置弹窗 ----------------------------
 class CheckOptionsDialog(tb.Toplevel):
@@ -1681,7 +1791,6 @@ class RuleEditorDialog(tb.Toplevel):
         main_frame = tb.Frame(self)
         main_frame.pack(fill='both', expand=True, padx=10, pady=5)
 
-        # 左侧：数据源配置（加宽，宽度420）
         left_frame = tb.Frame(main_frame, width=420)
         left_frame.pack(side='left', fill='y', padx=(0,10))
         left_frame.pack_propagate(False)
@@ -1689,55 +1798,45 @@ class RuleEditorDialog(tb.Toplevel):
         ds_frame = tb.Labelframe(left_frame, text="数据源配置", padding=10)
         ds_frame.pack(fill='both', expand=True, pady=5)
 
-        # 所有字段竖向排列
-        # 规则名称
         tb.Label(ds_frame, text="规则名称:").pack(anchor='w')
         self.rule_name_var = tk.StringVar()
         tb.Entry(ds_frame, textvariable=self.rule_name_var, width=40).pack(fill='x', pady=2)
 
-        # Sheet
         tb.Label(ds_frame, text="Sheet:").pack(anchor='w')
         self.sheet_var = tk.StringVar()
         sheets = self._get_sheet_names()
         self.sheet_cb = tb.Combobox(ds_frame, textvariable=self.sheet_var, values=sheets, width=38)
         self.sheet_cb.pack(fill='x', pady=2)
 
-        # 锚点文字
         tb.Label(ds_frame, text="锚点文字:").pack(anchor='w')
         self.anchor_text_var = tk.StringVar()
         tb.Entry(ds_frame, textvariable=self.anchor_text_var, width=40).pack(fill='x', pady=2)
 
-        # 搜索范围
         tb.Label(ds_frame, text="搜索范围:").pack(anchor='w')
         self.search_in_var = tk.StringVar(value='all')
         tb.Combobox(ds_frame, textvariable=self.search_in_var, values=['all','first_row','first_col'], width=38).pack(fill='x', pady=2)
 
-        # 模式
         tb.Label(ds_frame, text="模式:").pack(anchor='w')
         self.mode_var = tk.StringVar(value='offset')
         self.mode_cb = tb.Combobox(ds_frame, textvariable=self.mode_var, values=['offset','collect','intersection','range'], width=38)
         self.mode_cb.pack(fill='x', pady=2)
         self.mode_cb.bind('<<ComboboxSelected>>', lambda e: self._build_param_fields())
 
-        # 动态参数区（竖向排列）
         self.param_frame = tb.Frame(ds_frame)
         self.param_frame.pack(fill='x', pady=2)
         self._build_param_fields()
 
-        # 按钮在左侧底部
         btn_frame = tb.Frame(left_frame)
         btn_frame.pack(side='bottom', fill='x', pady=5)
         tb.Button(btn_frame, text="确定", bootstyle=PRIMARY, width=8, command=self.on_ok).pack(side='left', padx=5)
         tb.Button(btn_frame, text="取消", bootstyle="outline", width=8, command=self.on_cancel).pack(side='right', padx=5)
 
-        # 右侧：检查项配置（使用grid布局）
         right_frame = tb.Frame(main_frame)
         right_frame.pack(side='right', fill='both', expand=True)
 
         check_frame = tb.Labelframe(right_frame, text="检查项（可多选）", padding=10)
         check_frame.pack(fill='both', expand=True)
 
-        # 可滚动区域
         canvas = tk.Canvas(check_frame, highlightthickness=0)
         scrollbar = ttk.Scrollbar(check_frame, orient="vertical", command=canvas.yview)
         scrollable_frame = tb.Frame(canvas)
@@ -1755,14 +1854,12 @@ class RuleEditorDialog(tb.Toplevel):
             for key in keys:
                 row = tb.Frame(lf)
                 row.pack(fill='x', pady=1)
-                # 左列：开关 + 名称
                 left_cell = tb.Frame(row)
                 left_cell.pack(side='left', fill='x', expand=True)
                 var = tk.BooleanVar(value=True)
                 self.check_vars[key] = var
                 cb = tb.Checkbutton(left_cell, text=CHECK_OPTION_LABELS[key], variable=var, bootstyle="round-toggle")
                 cb.pack(side='left', anchor='w')
-                # 右列：期望 + 下拉
                 right_cell = tb.Frame(row)
                 right_cell.pack(side='right')
                 tb.Label(right_cell, text="期望:").pack(side='left', padx=(10,2))
@@ -1771,16 +1868,13 @@ class RuleEditorDialog(tb.Toplevel):
                 self.expect_vars[key] = expect_var
 
     def _build_param_fields(self):
-        # 清空旧内容
         for widget in self.param_frame.winfo_children():
             widget.destroy()
         mode = self.mode_var.get()
         if mode == 'offset':
-            # 行偏移
             tb.Label(self.param_frame, text="行偏移:").pack(anchor='w')
             self.offset_row_var = tk.StringVar(value='0')
             tb.Entry(self.param_frame, textvariable=self.offset_row_var, width=10).pack(fill='x', pady=2)
-            # 列偏移
             tb.Label(self.param_frame, text="列偏移:").pack(anchor='w')
             self.offset_col_var = tk.StringVar(value='0')
             tb.Entry(self.param_frame, textvariable=self.offset_col_var, width=10).pack(fill='x', pady=2)
@@ -1814,6 +1908,9 @@ class RuleEditorDialog(tb.Toplevel):
             tb.Label(self.param_frame, text="列数:").pack(anchor='w')
             self.range_col_count_var = tk.StringVar(value='1')
             tb.Entry(self.param_frame, textvariable=self.range_col_count_var, width=10).pack(fill='x', pady=2)
+            tb.Label(self.param_frame, text="排除单元格(逗号分隔，如A5,C7或[1,0]):").pack(anchor='w')
+            self.range_exclude_var = tk.StringVar(value='')
+            tb.Entry(self.param_frame, textvariable=self.range_exclude_var, width=30).pack(fill='x', pady=2)
 
     def _load_rule_data(self):
         self.rule_name_var.set(self.rule.rule_name)
@@ -1822,7 +1919,6 @@ class RuleEditorDialog(tb.Toplevel):
         self.anchor_text_var.set(ds.get('anchor', {}).get('text', ''))
         self.search_in_var.set(ds.get('search_in', 'all'))
 
-        # 先设置模式，再构建参数区，确保对应变量已创建
         self.mode_var.set(ds.get('mode', 'offset'))
         self._build_param_fields()
 
@@ -1841,13 +1937,14 @@ class RuleEditorDialog(tb.Toplevel):
             self.range_col_offset_var.set(str(target.get('col_offset', 0)))
             self.range_row_count_var.set(str(target.get('row_count', 1)))
             self.range_col_count_var.set(str(target.get('col_count', 1)))
+            ex_list = target.get('exclude', [])
+            self.range_exclude_var.set(','.join(str(x) if isinstance(x, str) else f"[{x[0]},{x[1]}]" for x in ex_list))
         elif mode == 'intersection':
             row_anchor = ds.get('row_anchor', {})
             col_anchor = ds.get('col_anchor', {})
             self.row_anchor_text_var.set(row_anchor.get('text', '').strip())
             self.col_anchor_text_var.set(col_anchor.get('text', '').strip())
 
-        # 加载检查项
         for check in self.rule.checks:
             if check.check_type in self.check_vars:
                 self.check_vars[check.check_type].set(check.enabled)
@@ -1881,7 +1978,8 @@ class RuleEditorDialog(tb.Toplevel):
                 'row_offset': int(self.range_row_offset_var.get()),
                 'col_offset': int(self.range_col_offset_var.get()),
                 'row_count': int(self.range_row_count_var.get()),
-                'col_count': int(self.range_col_count_var.get())
+                'col_count': int(self.range_col_count_var.get()),
+                'exclude': self._parse_exclude(self.range_exclude_var.get())
             }
         self.rule.data_source = ds
 
@@ -1902,11 +2000,24 @@ class RuleEditorDialog(tb.Toplevel):
         self.result = None
         self.destroy()
 
+    def _parse_exclude(self, text):
+        if not text.strip():
+            return []
+        parts = [p.strip() for p in text.split(',') if p.strip()]
+        exclude = []
+        for p in parts:
+            if re.match(r'^[A-Za-z]+\d+$', p):
+                exclude.append(p)
+            elif re.match(r'^\[\d+,\d+\]$', p):
+                inner = p[1:-1].split(',')
+                exclude.append([int(inner[0]), int(inner[1])])
+        return exclude
+
 # ======================== GUI ========================
 class DiffViewer:
     def __init__(self, root):
         self.root = root
-        self.root.title("Excel报告检查工具")  # 工具名称修改
+        self.root.title("Excel报告检查工具")
         self.root.geometry("1100x750")
         self.old_path = tk.StringVar()
         self.new_path = tk.StringVar()
@@ -2002,7 +2113,6 @@ class DiffViewer:
         self.result_data = None
 
     def browse(self, var):
-        # 修复：只允许 .xlsx 文件
         p = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
         if p:
             var.set(p)
@@ -2039,13 +2149,11 @@ class DiffViewer:
             pass
 
     def clear_check_project(self):
-        """退出规则模式，恢复常规差异对比，并清空结果"""
         self.check_project = None
         self.start_btn.configure(text="常规差异对比", width=12)
         self.settings_btn.configure(state='normal')
         self.config_btn.configure(text="导入规则", command=self.load_check_project)
         self.project_btn.configure(text="进阶检查规则", command=self.open_project_dialog)
-        # 清空结果
         self.tree.delete(*self.tree.get_children())
         self.detail.delete('1.0', 'end')
         self.diff_items = []
@@ -2053,7 +2161,6 @@ class DiffViewer:
         self.log("已退出规则检查模式，恢复常规差异对比")
 
     def load_check_project(self):
-        """加载检查项目集JSON文件，自动切换规则模式"""
         filepath = filedialog.askopenfilename(
             title="选择检查项目集文件",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
@@ -2064,7 +2171,6 @@ class DiffViewer:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             self.check_project = CheckProject.from_dict(data)
-            # 更新UI
             self.start_btn.configure(text=f"规则检查\n（{self.check_project.project_name}）", width=16)
             self.settings_btn.configure(state='disabled')
             self.config_btn.configure(text="退出规则模式", command=self.clear_check_project)
@@ -2102,7 +2208,6 @@ class DiffViewer:
         if not os.path.isfile(old) or not os.path.isfile(new):
             messagebox.showerror("错误", "文件不存在")
             return
-        # 修复：检查扩展名
         if not old.lower().endswith('.xlsx') or not new.lower().endswith('.xlsx'):
             messagebox.showerror("错误", "仅支持 .xlsx 格式文件")
             return
@@ -2179,18 +2284,30 @@ class DiffViewer:
 
     def populate_tree(self):
         diffs, sheet_diffs, stats = self.result_data
+        # 分组
+        normal_diffs = []
+        rule_pass_diffs = []
+        plugin_diffs = []
+        for d in diffs:
+            if d['sheet'] == '🔍 数据检查':
+                plugin_diffs.append(d)
+            elif d.get('rule_pass'):
+                rule_pass_diffs.append(d)
+            else:
+                normal_diffs.append(d)
+        # 显示Sheet结构差异
         if sheet_diffs:
             sn = self.tree.insert('', 'end', text='📋 Sheet 结构差异', open=True)
             for sd in sheet_diffs:
                 node = self.tree.insert(sn, 'end', text=sd['desc'], values=(sd['name'], sd['type']))
                 self.diff_items.append((node, {'type': 'sheet_struct', 'data': sd}))
-        plugin_diffs = [d for d in diffs if d['sheet'] == '🔍 数据检查']
-        normal_diffs = [d for d in diffs if d['sheet'] != '🔍 数据检查']
+        # 插件差异
         if plugin_diffs:
             pn = self.tree.insert('', 'end', text='🔍 数据检查结果', open=True)
             for d in plugin_diffs:
                 node = self.tree.insert(pn, 'end', text=d['desc'][:80], values=(d['address'], d['type']))
                 self.diff_items.append((node, {'type': 'cell', 'data': d}))
+        # 常规差异
         dmap = {}
         for d in normal_diffs:
             dmap.setdefault(d['sheet'], []).append(d)
@@ -2199,10 +2316,16 @@ class DiffViewer:
             for d in items:
                 node = self.tree.insert(pn, 'end', text=d['desc'][:80], values=(d['address'], d['type']))
                 self.diff_items.append((node, {'type': 'cell', 'data': d}))
+        # 进阶规则Pass
+        if rule_pass_diffs:
+            pn = self.tree.insert('', 'end', text='✅ 进阶规则Pass（已折叠）', open=False)
+            for d in rule_pass_diffs:
+                node = self.tree.insert(pn, 'end', text=d['desc'][:80], values=(d['address'], d['type']))
+                self.diff_items.append((node, {'type': 'cell', 'data': d}))
         enabled = sum(1 for v in self.check_options.values() if v)
         total = len(self.check_options)
         plugin_info = f"，{len(plugin_diffs)} 个插件告警" if plugin_diffs else ""
-        self.log(f"树形列表已加载，单击查看详情，双击跳转（启用 {enabled}/{total} 项检测{plugin_info}）")
+        self.log(f"树形列表已加载，单击查看详情，双击跳转（启用 {enabled}/{total} 项检测{plugin_info}，规则Pass {len(rule_pass_diffs)} 项）")
 
     def on_tree_select(self, event):
         sel = self.tree.selection()
@@ -2265,7 +2388,6 @@ class DiffViewer:
         cell_addr = data.get('address')
         if not sheet_name or not cell_addr:
             return
-        # 修复：地址格式验证
         if ':' in cell_addr:
             cell_addr = cell_addr.split(':')[0]
         if not re.match(r'^[A-Za-z]+[0-9]+$', cell_addr):
