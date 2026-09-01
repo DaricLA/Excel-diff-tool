@@ -10,7 +10,7 @@ from lxml import etree
 
 NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 PROGRAM_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
-VERSION = "v3.30"
+VERSION = "v3.53"
 
 DEFAULT_CHECK_OPTIONS = {
     'value': True, 'formula': True, 'rich_text': True, 'font': True,
@@ -1072,14 +1072,9 @@ class OpenpyxlComparer:
         now=time.time()
         if not force and (now-self._last_gui_update)<0.15: return
         if self._log_buffer:
-            ts=time.strftime('%H:%M:%S')
-            for m in self._log_buffer:
-                if '正在加载' in m or '已耗时' in m:
-                    try: self.log(m)
-                    except: pass
-                else:
-                    try: self.log(f"{ts} {m}")
-                    except: pass
+            for m in self._log_buffer:  # 时间戳/着色统一由 log() 处理
+                try: self.log(m)
+                except: pass
             self._log_buffer.clear(); self._last_gui_update=now
     def _buf_log(self, msg): self._log_buffer.append(msg)
     def _with_heartbeat(self, label, fn):
@@ -1118,6 +1113,8 @@ class OpenpyxlComparer:
                 old_wb=load_workbook(self.old_path,data_only=False); self._buf_log(f"旧版加载完成: {len(old_wb.sheetnames)} 个sheet"); self._flush_log(force=True)
                 self.progress(15,"正在加载新版文件..."); self._flush_log(force=True)
                 new_wb=load_workbook(self.new_path,data_only=False); self._buf_log(f"新版加载完成: {len(new_wb.sheetnames)} 个sheet"); self._flush_log(force=True)
+                # 懒加载标记：data_only=True 副本在 shift 规则首次遇到公式格时才加载
+                self.old_wb_values = None; self.new_wb_values = None
                 self.progress(20,"正在解析富文本..."); self._flush_log(force=True)
                 self.old_rich=parse_rich_text_from_xlsx(self.old_path); self.new_rich=parse_rich_text_from_xlsx(self.new_path)
                 self._buf_log(f"富文本解析完成：旧版 {sum(len(v) for v in self.old_rich.values())} 个，新版 {sum(len(v) for v in self.new_rich.values())} 个"); self._flush_log(force=True)
@@ -1227,8 +1224,10 @@ class OpenpyxlComparer:
                     nc=column_index_from_string(''.join(ch for ch in n_addr if ch.isalpha())); nrow=int(''.join(ch for ch in n_addr if ch.isdigit()))
                     old_cell=old_ws.cell(row=orow,column=oc); new_cell=new_ws.cell(row=nrow,column=nc)
                     diff=self._compare_by_check_type(check_type,old_cell,new_cell,check.options,old_ws,new_ws,o_addr,o_sheet,new_address=n_addr,new_sheet_name=n_sheet)
-                    if (check.expect=='same' and diff is None) or (check.expect=='different' and diff is not None):
-                        d['rule_pass']=True; d['rule_name']=rule.rule_name; matched=True; break
+                    if (check.expect=='same' and diff is None) or (check.expect=='different'):
+                        d['rule_pass']=True; d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; matched=True; break
+                    else:
+                        d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; matched=True; break
                 if matched: break
             if matched: continue
             for rule in hits:
@@ -1240,8 +1239,9 @@ class OpenpyxlComparer:
                     col=column_index_from_string(col_str); row=int(row_str)
                     old_cell=old_ws.cell(row=row,column=col); new_cell=new_ws.cell(row=row,column=col)
                     diff=self._compare_by_check_type(check_type,old_cell,new_cell,check.options,old_ws,new_ws,d['address'],d['sheet'])
-                    if check.expect=='same' and diff is None: d['rule_pass']=True; d['rule_name']=rule.rule_name; break
-                    elif check.expect=='different' and diff is not None: d['rule_pass']=True; d['rule_name']=rule.rule_name; break
+                    if (check.expect=='same' and diff is None) or (check.expect=='different'):
+                        d['rule_pass']=True; d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; break
+                    else: d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; break
                 if d.get('rule_pass'): break
     @staticmethod
     def _parse_row_spec(spec):
@@ -1277,18 +1277,36 @@ class OpenpyxlComparer:
         if m: return len(m)                                     # 0.0000 -> 4位
         if '%' in seg: return 2                                 # 百分比无小数位按2位
         return 0                                                # 整数显示（#,##0 等）
-    def _display_equivalent(self,old_cell,new_cell,old_sheet,new_sheet):
+    def _display_equivalent(self,old_cell,new_cell,old_sheet,new_sheet,old_val=None,new_val=None):
         # 两格值严格不等时，按 Excel 显示精度判定是否实质一致（跨版本保存的 ulp 浮点尾差豁免）
-        v1=old_cell.value; v2=new_cell.value
+        v1=old_val if old_val is not None else old_cell.value
+        v2=new_val if new_val is not None else new_cell.value
         if not (isinstance(v1,(int,float)) and isinstance(v2,(int,float))): return False
         try:
             f1=self._get_actual_number_format(old_cell,'old'); f2=self._get_actual_number_format(new_cell,'new')
             d1=self._fmt_decimals(f1); d2=self._fmt_decimals(f2)
-            if d1<0 or d2<0: return False                       # 日期时间或非数值格式：不放宽
-            if format(v1,f'.{d1}f')==format(v2,f'.{d2}f'): return True
-            # General 或格式差异等兜底：相对容差 1e-9（真实差异约1e-3量级，尾差约1e-16）
+            if d1<0 and d2<0: return False                      # 两边都是日期/非数值：不放宽
+            if (d1<0)!=(d2<0): return False                      # 一边日期一边数值：不等
+            # 以待检报告（新格）的格式精度为基准 round 后比较
+            # 旧格可能是公式（无限精度），新格是粘贴值的最终精度定义
+            if d2>=0:
+                d_use=d2  # 新格有显式格式，以新格精度为准
+            elif d1>=0:
+                d_use=d1  # 新格 General，旧格有显式格式，用旧格精度
+            else:
+                d_use=-1  # 两边都 General
+            if d_use>=0:
+                if format(v1,f'.{d_use}f')==format(v2,f'.{d_use}f'): return True
+            # 兜底：相对容差 1e-9
             return abs(v1-v2)<=1e-9*max(abs(v1),abs(v2),1.0)
         except Exception: return False
+    @staticmethod
+    def _try_number(s):
+        """字符串转数字，无法转换则返回原值"""
+        try: return int(s)
+        except ValueError:
+            try: return float(s)
+            except ValueError: return s
     def _compare_worksheet(self, old_ws,new_ws,sheet_name):
         opts=self.check_options
         _,_,old_rmax,old_cmax=self._real_data_range(old_ws); _,_,new_rmax,new_cmax=self._real_data_range(new_ws)
@@ -1540,24 +1558,53 @@ class OpenpyxlComparer:
             elif new_cf is None: self.diffs.append({'sheet':sheet_name,'address':rng.split(':')[0],'type':'条件格式删除','desc':f'删除条件格式范围: {rng}'})
             else:
                 od=self._cf_rule_diffs(old_cf.rules,new_cf.rules)
-                if od: self.diffs.append({'sheet':sheet_name,'address':rng.split(':')[0],'type':'条件格式修改','desc':f'条件格式规则变化（范围{rng}）：{od}'})
+                if od:
+                    short_desc=f'条件格式规则变化（范围{rng}）'
+                    self.diffs.append({'sheet':sheet_name,'address':rng.split(':')[0],'type':'条件格式修改','desc':f'条件格式规则变化（范围{rng}）：{od}','short_desc':short_desc})
+    # Excel 内置条件格式标准色 -> 中文色名
+    _CF_COLOR_NAMES={'FFC7CE':'浅红','9C0006':'深红','C6EFCE':'浅绿','006100':'深绿','FFEB9C':'浅黄','9C6500':'深黄',
+                     'FF0000':'红色','00B050':'绿色','FFFF00':'黄色','0070C0':'蓝色','FFFFFF':'白色','000000':'黑色'}
+
+    def _cf_color_desc(self, c):
+        """dxf 颜色对象 -> 可读描述（内置标准色显示中文名）；不可读返回 ''"""
+        if c is None: return ''
+        try:
+            rgb = getattr(c, 'rgb', None)
+            if isinstance(rgb, str):
+                s=rgb.strip()
+                # 合法 rgb 只含 hex 字符且长度为 6(RRGGBB) 或 8(AARRGGBB)；含其它字符的是 openpyxl 解析失败的错误串
+                if len(s) not in (6,8) or not all(ch in '0123456789ABCDEF' for ch in s.upper()): return ''
+                hx=s[-6:].upper()
+                if hx=='000000' and (len(s)==6 or s[:2]=='00'): return ''   # 未设色的占位（00000000 等），非真实黑色
+                name=self._CF_COLOR_NAMES.get(hx)
+                return f"{name}({hx})" if name else hx
+        except Exception: pass
+        return ''
+
     def _cf_dxf_brief(self, dxf):
         """条件格式 dxf 样式 -> 简要中文（填充/字色/加粗/斜体）"""
         if dxf is None: return '无格式'
         parts=[]
         try:
-            if dxf.fill is not None:
-                fg=getattr(getattr(dxf.fill,'fgColor',None),'rgb',None) or getattr(getattr(dxf.fill,'start_color',None),'rgb',None)
-                if fg: parts.append('填充%s'%str(fg)[-6:])
+            if getattr(dxf, 'fill', None) is not None:
+                fg = self._cf_color_desc(getattr(dxf.fill, 'fgColor', None)) or self._cf_color_desc(getattr(dxf.fill, 'start_color', None)) or self._cf_color_desc(getattr(dxf.fill, 'bgColor', None)) or self._cf_color_desc(getattr(dxf.fill, 'end_color', None))
+                if fg: parts.append('填充'+fg)
         except Exception: pass
         try:
-            if dxf.font is not None:
-                c=getattr(dxf.font,'color',None)
-                if c is not None and getattr(c,'rgb',None): parts.append('字色%s'%str(c.rgb)[-6:])
-                if getattr(dxf.font,'b',False): parts.append('加粗')
-                if getattr(dxf.font,'i',False): parts.append('斜体')
+            if getattr(dxf, 'font', None) is not None:
+                fc = self._cf_color_desc(getattr(dxf.font, 'color', None))
+                if fc: parts.append('字色'+fc)
+                if getattr(dxf.font, 'b', False): parts.append('加粗')
+                if getattr(dxf.font, 'i', False): parts.append('斜体')
         except Exception: pass
         return '/'.join(parts) if parts else '无格式'
+
+    _CF_TYPE_MAP={'cellIs':'单元格值','expression':'公式','containsText':'包含文本','notContainsText':'不含文本',
+                  'containsBlanks':'包含空值','notContainsBlanks':'不含空值','containsErrors':'包含错误','notContainsErrors':'不含错误',
+                  'duplicateValues':'重复值','uniqueValues':'唯一值','top10':'前N项','aboveAverage':'高于均值','belowAverage':'低于均值',
+                  'colorScale':'色阶','dataBar':'数据条','iconSet':'图标集'}
+    _CF_OP_MAP={'greaterThan':'大于','lessThan':'小于','equal':'等于','notEqual':'不等于','greaterThanOrEqual':'大于等于',
+                'lessThanOrEqual':'小于等于','between':'介于','notBetween':'不介于','containsText':'包含'}
 
     def _cf_rule_summaries(self, rules):
         out=[]
@@ -1565,10 +1612,17 @@ class OpenpyxlComparer:
             try:
                 f=getattr(r,'formula',None)
                 if isinstance(f,(list,tuple)): f=','.join(str(x) for x in f)
-                out.append({'type':getattr(r,'type','?'),'priority':getattr(r,'priority','?'),
-                            'formula':str(f) if f is not None else '','dxf':self._cf_dxf_brief(getattr(r,'dxf',None))})
+                rt=getattr(r,'type','?') or '?'; op=getattr(r,'operator',None)
+                cond=self._CF_TYPE_MAP.get(rt,rt)
+                if op and op in self._CF_OP_MAP: cond+='（'+self._CF_OP_MAP[op]+'）'
+                dxf_obj=getattr(r,'dxf',None)
+                has_fmt=bool(dxf_obj is not None and (getattr(dxf_obj,'fill',None) is not None or getattr(dxf_obj,'font',None) is not None))
+                out.append({'cond':cond,'priority':getattr(r,'priority','?'),
+                            'formula':str(f) if f is not None else '',
+                            'dxf':self._cf_dxf_brief(dxf_obj),'has_fmt':has_fmt,
+                            'stop':bool(getattr(r,'stopIfTrue',False))})
             except Exception:
-                out.append({'type':'?','priority':'?','formula':'','dxf':'?'})
+                out.append({'cond':'?','priority':'?','formula':'','dxf':'?','has_fmt':False,'stop':False})
         return out
 
     def _cf_rule_diffs(self, old_rules, new_rules):
@@ -1578,16 +1632,19 @@ class OpenpyxlComparer:
         for i in range(max(len(o),len(n))):
             ro=o[i] if i<len(o) else None; rn=n[i] if i<len(n) else None
             if ro is None:
-                parts.append(f"新增规则{i+1}[{rn['type']}/优先级{rn['priority']}] 公式{rn['formula'] or '无'} {rn['dxf']}"); continue
+                parts.append(f"新增规则{i+1}[{rn['cond']}/优先级{rn['priority']}] 公式{rn['formula'] or '无'} {rn['dxf']}"+('，为真则停止' if rn['stop'] else '')); continue
             if rn is None:
-                parts.append(f"删除规则{i+1}[{ro['type']}/优先级{ro['priority']}] 公式{ro['formula'] or '无'} {ro['dxf']}"); continue
+                parts.append(f"删除规则{i+1}[{ro['cond']}/优先级{ro['priority']}] 公式{ro['formula'] or '无'} {ro['dxf']}"+('，为真则停止' if ro['stop'] else '')); continue
             if ro==rn: continue
             sub=[]
-            if ro['type']!=rn['type']: sub.append(f"类型{ro['type']}→{rn['type']}")
+            if ro['cond']!=rn['cond']: sub.append(f"条件{ro['cond']}→{rn['cond']}")
             if str(ro['priority'])!=str(rn['priority']): sub.append(f"优先级{ro['priority']}→{rn['priority']}")
             if ro['formula']!=rn['formula']: sub.append(f"公式{ro['formula'] or '无'}→{rn['formula'] or '无'}")
-            if ro['dxf']!=rn['dxf']: sub.append(f"格式{ro['dxf']}→{rn['dxf']}")
-            parts.append(f"规则{i+1}[{rn['type']}/优先级{rn['priority']}] "+'，'.join(sub))
+            # 新版有填充/字体对象但读不出颜色（openpyxl 解析主题色失败）时，跳过格式对比避免误报
+            if ro['dxf']!=rn['dxf'] and not (rn['has_fmt'] and rn['dxf'] in ('无格式','?')):
+                sub.append(f"格式{ro['dxf']}→{rn['dxf']}")
+            if ro['stop']!=rn['stop']: sub.append('勾消为真则停止' if ro['stop'] else '勾选为真则停止')
+            parts.append(f"规则{i+1}[{rn['cond']}/优先级{rn['priority']}] "+'，'.join(sub))
         return '；'.join(parts)
 
     def _compare_by_check_type(self, check_type, old_cell, new_cell, options=None, old_ws=None, new_ws=None, address=None, sheet_name='', new_address=None, new_sheet_name=''):
@@ -1599,9 +1656,27 @@ class OpenpyxlComparer:
                 of=self.old_cache.find_array_formula(sheet_name,old_cell.row,old_cell.column) or formula_text(old_cell.value)
                 nf=self.new_cache.find_array_formula(new_sheet_name,new_cell.row,new_cell.column) or formula_text(new_cell.value)
                 if of and nf and normalize_formula(of)==normalize_formula(nf): return None
-            if old_cell.value!=new_cell.value:
-                if self._display_equivalent(old_cell,new_cell,sheet_name,new_sheet_name): return None
-                return f"{old_cell.value} → {new_cell.value}"
+            # 公式格：懒加载 data_only 副本取缓存值（首次遇到才加载）
+            ov = old_cell.value; nv = new_cell.value
+            if isinstance(ov, str) and ov.startswith('='):
+                if self.old_wb_values is None:
+                    self._buf_log("首次遇到公式格，加载旧版缓存值副本..."); self._flush_log(force=True)
+                    self.old_wb_values = load_workbook(self.old_path, data_only=True)
+                try:
+                    ov = self.old_wb_values[sheet_name].cell(old_cell.row, old_cell.column).value
+                    if isinstance(ov, str): ov = self._try_number(ov)
+                except Exception: pass
+            if isinstance(nv, str) and nv.startswith('='):
+                if self.new_wb_values is None:
+                    self._buf_log("首次遇到公式格，加载新版缓存值副本..."); self._flush_log(force=True)
+                    self.new_wb_values = load_workbook(self.new_path, data_only=True)
+                try:
+                    nv = self.new_wb_values[new_sheet_name].cell(new_cell.row, new_cell.column).value
+                    if isinstance(nv, str): nv = self._try_number(nv)
+                except Exception: pass
+            if ov != nv:
+                if self._display_equivalent(old_cell,new_cell,sheet_name,new_sheet_name,ov,nv): return None
+                return f"{ov} → {nv}"
         elif check_type=='formula':
             of=formula_text(old_cell.value); nf=formula_text(new_cell.value)
             # 数组/共享公式成员格：回退到锚点公式区域匹配
@@ -1700,15 +1775,18 @@ class ExcelCOMVerifier:
     COM_VERIFY_TYPES = {'填充变化','字体变化','边框变化','数字格式变化','行高变化','列宽变化','对齐变化'}
     SAMPLE_SIZE = 20
 
-    def __init__(self, old_path, new_path, log_callback=None):
+    def __init__(self, old_path, new_path, log_callback=None, progress_fn=None, progress_mode_fn=None):
         self.old_path = os.path.abspath(old_path)
         self.new_path = os.path.abspath(new_path)
         self.log = log_callback if log_callback else print
+        self._progress = progress_fn if progress_fn else (lambda v,s=None: None)
+        self._progress_mode = progress_mode_fn if progress_mode_fn else (lambda m: None)
         self.excel_app = None
         self.old_wb = None
         self.new_wb = None
         self._opened_old = False
         self._opened_new = False
+        self._created_excel = False
 
     def verify(self, diffs):
         """对 diffs 列表进行分组抽样复核，就地修改 diff 的 rule_pass/rule_name 字段。
@@ -1716,6 +1794,7 @@ class ExcelCOMVerifier:
         verifiable = [d for d in diffs if d.get('type') in self.COM_VERIFY_TYPES]
         if not verifiable:
             self.log("高级审核：无可复核的差异项")
+            self._progress(100,'高级审核跳过')
             return len(diffs), 0
 
         # 分组：(type, desc) → [diff, ...]
@@ -1725,18 +1804,23 @@ class ExcelCOMVerifier:
             groups.setdefault(key, []).append(d)
 
         self.log(f"高级审核：{len(verifiable)} 条差异分为 {len(groups)} 组，开始连接 Excel...")
+        self._progress_indet('正在连接 Excel...')
 
         if not self._connect_excel():
             self.log("高级审核：无法连接 Excel，跳过复核")
-            return len(diffs), 0
+            self._progress_det(100); return len(diffs), 0
         if not self._ensure_workbooks():
             self.log("高级审核：无法打开工作簿，跳过复核")
             self._release_workbooks()
-            return len(diffs), 0
+            self._progress_det(100); return len(diffs), 0
 
         exempt_count = 0
         confirmed_count = 0
         verified_groups = 0
+        total_groups=len(groups)
+        try: self._progress_mode('determinate')
+        except Exception: pass
+        self._progress(0,'高级审核中...')
 
         for (dtype, desc), group_diffs in groups.items():
             n = len(group_diffs)
@@ -1762,10 +1846,25 @@ class ExcelCOMVerifier:
                 for d in group_diffs: d['com_confirmed']=True
                 self.log(f"  ✗ [{dtype}] 抽样发现真实差异，保留 {n} 条（红色标记）")
             verified_groups += 1
+            try: self._progress(int(100*verified_groups/total_groups),f'高级审核 {verified_groups}/{total_groups} 组')
+            except Exception: pass
 
         self.log(f"高级审核完成：{verified_groups} 组，豁免 {exempt_count} 条，保留 {confirmed_count} 条")
+        try: self._progress(100,'高级审核完成')
+        except Exception: pass
         self._release_workbooks()
         return confirmed_count, exempt_count
+
+    def _progress_det(self, v):
+        """切 determinate 并设值（0-100）"""
+        try:
+            self._progress_mode('determinate')
+            self._progress(v,'高级审核中...')
+        except Exception: pass
+
+    def _progress_indet(self, label=''):
+        try: self._progress_mode('indeterminate')
+        except Exception: pass
 
     def _connect_excel(self):
         try:
@@ -1776,6 +1875,7 @@ class ExcelCOMVerifier:
             pass
         try:
             self.excel_app = win32com.client.DispatchEx("Excel.Application")
+            self._created_excel = True
             self.excel_app.Visible = False
             self.excel_app.DisplayAlerts = False
             self.log("高级审核：已创建新 Excel 实例")
@@ -1814,9 +1914,14 @@ class ExcelCOMVerifier:
                 self.new_wb.Close(SaveChanges=False)
         except Exception:
             pass
+        if self._created_excel and self.excel_app:
+            try: self.excel_app.Quit()
+            except Exception: pass
+            self.log("高级审核：已关闭隐藏 Excel 实例")
         self.old_wb = None
         self.new_wb = None
         self.excel_app = None
+        self._created_excel = False
 
     def _verify_single(self, diff):
         """COM 读取单个差异格的显示值，返回 True 表示两边显示一致（可豁免）。"""
@@ -2250,6 +2355,7 @@ class RuleEditorDialog(tb.Toplevel):
 class DiffViewer:
     def __init__(self,root):
         self.root=root; self.root.title(f"MBO PBO报告检查工具 {VERSION}"); self.root.geometry("1100x750")
+        pythoncom.CoInitialize()  # 主线程初始化 COM，确保 GetActiveObject 等可用
         self.old_path=tk.StringVar(); self.new_path=tk.StringVar(); self.topmost=tk.BooleanVar(value=False)
         self.check_options=dict(DEFAULT_CHECK_OPTIONS); self.plugin_manager=None; self.config_file=None; self.stop_event=threading.Event(); self.check_project=None; self.old_sheet_order=[]
         self.color_tolerance=tk.IntVar(value=0)
@@ -2278,13 +2384,27 @@ class DiffViewer:
             _st=ttk.Style(); _st.configure('Vertical.TScrollbar',width=22)
         except Exception: pass
         sb=tb.Scrollbar(tree_frame,orient='vertical',command=self.tree.yview,bootstyle=ROUND)
-        try: _ws=ttk.Style(); _ws.configure('Wide.Vertical.TScrollbar',width=44); sb.configure(style='Wide.Vertical.TScrollbar')
+        # 加宽滚动条：直接对 ttkbootstrap 实际生效的样式名设置宽度，避免被主题默认值覆盖
+        try:
+            _ws=ttk.Style()
+            real_style=sb.cget('style') or 'Vertical.TScrollbar'
+            for _sn in {real_style,'Vertical.TScrollbar'}:
+                try: _ws.configure(_sn,width=30,arrowsize=16)
+                except Exception: pass
         except Exception: pass
         self.tree.configure(yscrollcommand=sb.set); self.tree.grid(row=0,column=0,sticky='nsew'); sb.grid(row=0,column=1,sticky='ns')
         self.tree.bind('<<TreeviewSelect>>',self.on_tree_select); self.tree.bind('<Double-1>',self.on_tree_double_click); self.tree.bind('<Button-1>',self.on_tree_click)
         bottom=tb.Frame(root,padding=5); bottom.pack(fill='x'); bottom.columnconfigure(0,weight=0); bottom.columnconfigure(1,weight=1)
         df=tb.Labelframe(bottom,text="差异详情",padding=5,bootstyle=INFO); df.grid(row=0,column=0,sticky='nsew',padx=(0,3)); self.detail=tk.Text(df,width=42,height=6,wrap='word',font=("微软雅黑",9),bg='#ffffff',fg='#212529',relief='flat',highlightthickness=1,highlightbackground='#dee2e6',highlightcolor='#0d6efd',padx=5,pady=5); self.detail.pack(fill='both',expand=True)
         lf=tb.Labelframe(bottom,text="日志",padding=5,bootstyle=SECONDARY); lf.grid(row=0,column=1,sticky='nsew',padx=(3,0)); self.log_text=tk.Text(lf,height=6,wrap='word',font=("微软雅黑",9),bg='#ffffff',fg='#212529',relief='flat',highlightthickness=1,highlightbackground='#dee2e6',highlightcolor='#0d6efd',padx=5,pady=5); self.log_text.pack(fill='both',expand=True)
+        # 日志着色 tag
+        self.log_text.tag_configure('ts',foreground='#9aa0a6',font=("微软雅黑",8))
+        self.log_text.tag_configure('log_ok',foreground='#198754')
+        self.log_text.tag_configure('log_bad',foreground='#dc3545')
+        self.log_text.tag_configure('log_bold',font=("微软雅黑",9,'bold'))
+        self.log_text.tag_configure('log_red_bold',foreground='#dc3545',font=("微软雅黑",9,'bold'))
+        self.log_text.tag_configure('log_blue_bold',foreground='#0d6efd',font=("微软雅黑",9,'bold'))
+        self.log_text.tag_configure('log_hb',foreground='#6c757d')
         self.diff_items=[]; self.result_data=None; self._modal_busy=False
         self.old_entry.bind('<Enter>',lambda e:self._show_path_tip(e,self.old_path.get()))
         self.old_entry.bind('<Leave>',lambda e:self._hide_path_tip())
@@ -2353,11 +2473,45 @@ class DiffViewer:
         except Exception as e: messagebox.showerror("错误",f"打开配置列表失败：{str(e)}")
         finally:
             self._active_modal=None; self._modal_busy=False
+    def _log_tag(self,msg):
+        """根据日志内容返回着色 tag"""
+        if '✗' in msg or '✕' in msg: return 'log_bad'
+        if any(k in msg for k in ('异常','失败','错误','无法','跳过复核')): return 'log_bad'
+        if '✓' in msg or '✔' in msg: return 'log_ok'
+        if any(k in msg for k in ('高级审核完成','解析完成','检查总计耗时','对比阶段耗时','开始新的检查')): return 'log_bold'
+        return None
+
+    def _insert_summary_line(self,msg):
+        """检查完成统计行分段着色：需人工复核=红粗，已豁免=蓝粗"""
+        import re as _re
+        m=_re.match(r'^(检查完成(?:\(异常中断\))?[：:]\s*)',msg)
+        prefix=m.group(1) if m else ''
+        if prefix: self.log_text.insert('end',prefix,'log_bold')
+        rest=msg[len(prefix):]
+        # 按关键统计项边界切分，保留中间的逗号分隔符
+        segs=_re.split(r'(?=需人工复核|已豁免|插件)',rest)
+        for s in segs:
+            if not s: continue
+            if s.startswith('需人工复核'): self.log_text.insert('end',s,'log_red_bold')
+            elif s.startswith('已豁免'): self.log_text.insert('end',s,'log_blue_bold')
+            else: self.log_text.insert('end',s,'log_bold')
+        self.log_text.insert('end','\n')
+
     def log(self,msg):
         def _log():
             ls=self.log_text.index('end-2l'); last=self.log_text.get(ls,'end-1c')
-            if ('正在加载' in last or '已耗时' in last) and ('正在加载' in msg or '已耗时' in msg): self.log_text.delete(ls,'end-1c')
-            self.log_text.insert('end',msg+'\n'); self.log_text.see('end')
+            is_hb=('正在加载' in msg or '已耗时' in msg)
+            if ('正在加载' in last or '已耗时' in last) and is_hb: self.log_text.delete(ls,'end-1c')
+            if is_hb:
+                self.log_text.insert('end',msg+'\n','log_hb')  # 心跳刷新行：灰色，不加时间戳
+            elif msg.startswith('检查完成'):
+                self.log_text.insert('end',time.strftime('%H:%M:%S')+' ','ts')
+                self._insert_summary_line(msg)
+            else:
+                self.log_text.insert('end',time.strftime('%H:%M:%S')+' ','ts')
+                tag=self._log_tag(msg)
+                self.log_text.insert('end',msg+'\n',tag) if tag else self.log_text.insert('end',msg+'\n')
+            self.log_text.see('end')
         self.root.after(0,_log)
     def update_progress(self,val,stat=""): self.root.after(0,lambda:self.progress.configure(value=val))
     def set_progress_mode(self,mode):
@@ -2371,14 +2525,27 @@ class DiffViewer:
             app=win32com.client.GetActiveObject("Excel.Application")
             return {normalize_path(w.FullName) for w in app.Workbooks}
         except Exception: return None
+
+    @staticmethod
+    def _is_file_locked(fp):
+        """检测文件是否被其他进程锁定（如 Excel）"""
+        try:
+            f=open(fp,'ab'); f.close(); return False
+        except (IOError,PermissionError): return True
+
     def _prep_advanced_audit(self,old,new):
         # 第一步：确保两份报告已在 Excel 打开（os.startfile）；第二步：COM 通道确认窗。False=中止
         miss=[]
         paths=self._excel_open_paths()
-        if paths is None: miss=[old,new]
+        if paths is None:
+            miss=[old,new]
         else:
             if normalize_path(old) not in paths: miss.append(old)
             if normalize_path(new) not in paths: miss.append(new)
+        # 文件锁兜底：COM 没找到（可能返回了其他 Excel 实例），但文件已被锁定说明确实打开了
+        if miss and self._is_file_locked(old) and self._is_file_locked(new):
+            self.log("检测到文件已在 Excel 中打开，跳过开启确认")
+            miss=[]
         if miss:
             choice=messagebox.askyesnocancel("高级审核","高级审核需通过 Excel COM 调用显示层，报告文件尚未打开。\n是＝立即打开报告并继续；否＝仅做常规对比（不审核）；取消＝中止本次检查。")
             if choice is None: return False
@@ -2391,6 +2558,10 @@ class DiffViewer:
                 while time.time()<deadline:
                     time.sleep(1); ps=self._excel_open_paths()
                     if ps is not None and normalize_path(old) in ps and normalize_path(new) in ps: ok_all=True; break
+                    # 文件锁兜底：os.startfile 可能在另一个实例中打开
+                    if self._is_file_locked(old) and self._is_file_locked(new):
+                        self.log("文件已在 Excel 中打开（其他实例），跳过等待")
+                        ok_all=True; break
                 if not ok_all and not messagebox.askyesno("高级审核","报告打开超时，是否仍继续高级审核？"): return False
             else:
                 self.com_verify.set(False); self.log("已跳过高级审核，仅执行常规对比"); return True
@@ -2415,7 +2586,7 @@ class DiffViewer:
                 if do_com:
                     self.log("启动 Excel COM 显示层复核...")
                     try:
-                        verifier=ExcelCOMVerifier(old,new,self.log)
+                        verifier=ExcelCOMVerifier(old,new,self.log,progress_fn=self.update_progress,progress_mode_fn=self.set_progress_mode)
                         verifier.verify(comparer.diffs)
                     except Exception as e:
                         self.log(f"高级审核异常: {e}，保留 openpyxl 结果")
@@ -2451,6 +2622,24 @@ class DiffViewer:
             for k in kids: self.tree.item(k,open=True)
             self.tree.heading('action',text='收起')
     def populate_tree(self):
+        self._pt_err=None
+        try:
+            self._populate_tree_inner()
+        except Exception as e:
+            self._pt_err=e
+            import traceback; tb=traceback.format_exc()
+            self.log(f"[populate_tree 异常] {e}")
+            self.log(tb)
+        finally:
+            if self._pt_err:
+                try:
+                    diffs,_,_=self.result_data
+                    nr=sum(1 for d in diffs if not d.get('rule_pass') and d.get('sheet')!='🔍 数据检查')
+                    rp=sum(1 for d in diffs if d.get('rule_pass'))
+                    pl=sum(1 for d in diffs if d.get('sheet')=='🔍 数据检查')
+                    self.log(f"检查完成(异常中断): 需人工复核 {nr} 项，已豁免 {rp} 项，插件 {pl} 项")
+                except Exception: pass
+    def _populate_tree_inner(self):
         self.tree.heading('action',text='收起')
         diffs,sheet_diffs,stats=self.result_data; normal=[]; rule_pass=[]; plugin=[]
         for d in diffs:
@@ -2458,43 +2647,96 @@ class DiffViewer:
             elif d.get('rule_pass'): rule_pass.append(d)
             else: normal.append(d)
         if sheet_diffs:
-            sn=self.tree.insert('','end',text='📋 Sheet 结构差异',open=True,tags=('sheet',))
+            sn=self.tree.insert('','end',text=f'📋 Sheet 结构差异（{len(sheet_diffs)}）',open=True,tags=('sheet',))
             for sd in sheet_diffs: node=self.tree.insert(sn,'end',text=sd['desc'],values=('[−]',sd['name'],sd['type'])); self.diff_items.append((node,{'type':'sheet_struct','data':sd}))
         if plugin:
-            pn=self.tree.insert('','end',text='🔍 数据检查结果',open=True,tags=('sheet',))
+            pn=self.tree.insert('','end',text=f'🔍 数据检查结果（{len(plugin)}）',open=True,tags=('sheet',))
             for d in plugin: node=self.tree.insert(pn,'end',text=d['desc'][:80],values=('[−]',d['address'],d['type'])); self.diff_items.append((node,{'type':'cell','data':d}))
         if normal:
-            pn=self.tree.insert('','end',text='⚠️ 需人工复核（未豁免）',open=True,tags=('warning_sheet',)); dmap={}
+            pn=self.tree.insert('','end',text=f'⚠️ 需人工复核（未豁免）（{len(normal)}）',open=True,tags=('warning_sheet',)); dmap={}
             for d in normal: dmap.setdefault(d['sheet'],[]).append(d)
             for sname in self.old_sheet_order:
                 if sname in dmap:
-                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}",open=True,tags=('sheet',))
-                    for d in dmap[sname]: node=self.tree.insert(sn,'end',text=d['desc'][:80],values=('[−]',d['address'],d['type']),tags=(('com_fail',) if d.get('com_confirmed') else ())); self.diff_items.append((node,{'type':'cell','data':d}))
+                    merged=self._merge_cell_ranges(dmap[sname]); n_disp=sum(d.get("_merged_count",1) for d in merged)
+                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,tags=('sheet',))
+                    for d in merged:
+                        tag=d.get('rule_name') and not d.get('rule_pass')
+                        node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:120],values=('[−]',d['address'],d['type']),tags=(('com_fail',) if d.get('com_confirmed') else (('rule_fail',) if tag else ()))); self.diff_items.append((node,{'type':'cell','data':d}))
             for sname in dmap:
                 if sname not in self.old_sheet_order:
-                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}",open=True,tags=('sheet',))
-                    for d in dmap[sname]: node=self.tree.insert(sn,'end',text=d['desc'][:80],values=('[−]',d['address'],d['type']),tags=(('com_fail',) if d.get('com_confirmed') else ())); self.diff_items.append((node,{'type':'cell','data':d}))
+                    merged=self._merge_cell_ranges(dmap[sname]); n_disp=sum(d.get("_merged_count",1) for d in merged)
+                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,tags=('sheet',))
+                    for d in merged:
+                        tag=d.get('rule_name') and not d.get('rule_pass')
+                        node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:120],values=('[−]',d['address'],d['type']),tags=(('com_fail',) if d.get('com_confirmed') else (('rule_fail',) if tag else ()))); self.diff_items.append((node,{'type':'cell','data':d}))
         if rule_pass:
-            pn=self.tree.insert('','end',text='✅ 已豁免（可展开）',open=False,tags=('sheet',)); dmap={}
+            pn=self.tree.insert('','end',text=f'✅ 已豁免（可展开）（{len(rule_pass)}）',open=False,tags=('sheet',)); dmap={}
             for d in rule_pass: dmap.setdefault(d['sheet'],[]).append(d)
             for sname in self.old_sheet_order:
                 if sname in dmap:
-                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}",open=True,tags=('sheet',))
-                    for d in dmap[sname]:
-                        desc=d['desc']+(f" [规则: {d['rule_name']}]" if d.get('rule_name') else ''); node=self.tree.insert(sn,'end',text=desc[:100],values=('[−]',d['address'],d['type'])); self.diff_items.append((node,{'type':'cell','data':d}))
+                    merged=self._merge_cell_ranges(dmap[sname]); n_disp=sum(d.get('_merged_count',1) for d in merged)
+                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,tags=('sheet',))
+                    for d in merged: node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:100],values=('[−]',d['address'],d['type'])); self.diff_items.append((node,{'type':'cell','data':d}))
             for sname in dmap:
                 if sname not in self.old_sheet_order:
-                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}",open=True,tags=('sheet',))
-                    for d in dmap[sname]:
-                        desc=d['desc']+(f" [规则: {d['rule_name']}]" if d.get('rule_name') else ''); node=self.tree.insert(sn,'end',text=desc[:100],values=('[−]',d['address'],d['type'])); self.diff_items.append((node,{'type':'cell','data':d}))
+                    merged=self._merge_cell_ranges(dmap[sname]); n_disp=sum(d.get('_merged_count',1) for d in merged)
+                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,tags=('sheet',))
+                    for d in merged: node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:100],values=('[−]',d['address'],d['type'])); self.diff_items.append((node,{'type':'cell','data':d}))
+
         self.log(f"检查完成：需人工复核 {len(normal)} 项，已豁免 {len(rule_pass)} 项，插件 {len(plugin)} 项")
+    @staticmethod
+    def _merge_cell_ranges(items):
+        """将同行同规则同类型的相邻单元格合并为区域表达，如 D29,E29,F29,G29 → D29:G29。
+        返回排序后的合并项列表，count 为原始条目数。"""
+        groups={}  # (rule_name,type,row) → {cols, items, sheet, desc, ...}
+        flat=[]
+        for item in items:
+            addr=item.get('address','')
+            if ':' in addr: flat.append(item); continue
+            col_s=''.join(ch for ch in addr if ch.isalpha()); row_s=''.join(ch for ch in addr if ch.isdigit())
+            if not col_s or not row_s: flat.append(item); continue
+            col=column_index_from_string(col_s); row=int(row_s)
+            key=(item.get('rule_name',''),item.get('type',''),row)
+            if key not in groups: groups[key]={'cols':[],'items':[],'sheet':item['sheet'],'desc':item['desc'],'rule_expect':item.get('rule_expect',''),'rule_pass':item.get('rule_pass',False),'com_confirmed':False,'count':0}
+            groups[key]['cols'].append(col); groups[key]['items'].append(item); groups[key]['count']+=1
+            if item.get('com_confirmed'): groups[key]['com_confirmed']=True
+        result=list(flat)
+        for key,data in groups.items():
+            cols=sorted(set(data['cols'])); ranges=[]; cur=[cols[0]]
+            for c in cols[1:]:
+                if c==cur[-1]+1: cur.append(c)
+                else: ranges.append(cur); cur=[c]
+            ranges.append(cur)
+            for cr in ranges:
+                if len(cr)==1:
+                    for it in data['items']:
+                        if ''.join(ch for ch in it.get('address','') if ch.isalpha())==get_column_letter(cr[0]): result.append(it); break
+                else:
+                    fc=get_column_letter(cr[0]); lc=get_column_letter(cr[-1]); row=key[2]
+                    merged=dict(data['items'][0]); merged['address']=f"{fc}{row}:{lc}{row}"; merged['desc']=f"{data['desc']} ({len(cr)}项)"; merged['_merged_count']=len(cr)
+                    result.append(merged)
+        def _sk(it):
+            a=it.get('address','')
+            if ':' in a: a=a.split(':')[0]
+            cs=''.join(ch for ch in a if ch.isalpha()); rs=''.join(ch for ch in a if ch.isdigit())
+            return (99999,0) if not cs or not rs else (int(rs),column_index_from_string(cs))
+        result.sort(key=_sk)
+        return result
+
     def on_tree_select(self,event):
         sel=self.tree.selection()
         if not sel: return
         target=next((d for n,d in self.diff_items if n==sel[0]),None)
         if not target: return
         if target['type'] in ('cell','sheet_struct'):
-            d=target['data']; self.detail.delete('1.0','end'); self.detail.insert('1.0',f"Sheet: {d['sheet']}\n位置: {d.get('address','?')}\n类型: {d['type']}\n描述: {d['desc']}")
+            d=target['data']
+            lines=[f"Sheet: {d['sheet']}",f"位置: {d.get('address','?')}",f"类型: {d['type']}",f"描述: {d['desc']}"]
+            if d.get('rule_name'):
+                lines.append(f"规则: {d['rule_name']}")
+                if d.get('rule_expect'): lines.append(f"期望: {d['rule_expect']}")
+                lines.append(f"结果: {'已豁免' if d.get('rule_pass') else '未豁免'}")
+            if d.get('com_confirmed'): lines.append("COM复核: 确认差异")
+            self.detail.delete('1.0','end'); self.detail.insert('1.0','\n'.join(lines))
     def on_tree_click(self,event):
         if self.tree.identify_region(event.x,event.y)!='cell': return
         if self.tree.identify_column(event.x)!='#1': return
@@ -2511,13 +2753,18 @@ class DiffViewer:
             wb=None
             for w in excel.Workbooks:
                 if normalize_path(w.FullName)==normalize_path(file_path): wb=w; break
+            # 文件锁兜底：GetActiveObject 返回了其他 Excel 实例，用 GetObject 直接获取 workbook
+            if wb is None and self._is_file_locked(file_path):
+                try: wb=win32com.client.GetObject(file_path)
+                except Exception: pass
             if wb is None: return False,f"文件未在 Excel 中打开：{file_path}"
             wb.Activate()
+            app=wb.Application
             try: ws=wb.Worksheets(sheet_name)
             except Exception as e: return False,f"工作表不存在：{sheet_name}（{e}）"
             ws.Activate(); col=''.join(ch for ch in cell_addr if ch.isalpha()); row=''.join(ch for ch in cell_addr if ch.isdigit())
             if not col or not row: return False,f"无效单元格地址：{cell_addr}"
-            excel.ActiveWindow.ScrollRow=int(row); excel.ActiveWindow.ScrollColumn=column_index_from_string(col); ws.Range(cell_addr).Select(); return 'opened',None
+            app.ActiveWindow.ScrollRow=int(row); app.ActiveWindow.ScrollColumn=column_index_from_string(col); ws.Range(cell_addr).Select(); return 'opened',None
         except Exception as e: return False,str(e)
     def on_tree_double_click(self,event):
         sel=self.tree.selection()
