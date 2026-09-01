@@ -1274,8 +1274,9 @@ class OpenpyxlComparer:
         base=seg.split(']')[-1]
         if re.search(r'[ymdhs]',base,re.I): return -1          # 日期时间，不放宽
         m=re.findall(r'\d',seg.split('.')[1].split(';')[0]) if '.' in seg else []
+        if '%' in seg:
+            return (len(m) if m else 0) + 2                     # 百分比：小数位数+2（%=×100）
         if m: return len(m)                                     # 0.0000 -> 4位
-        if '%' in seg: return 2                                 # 百分比无小数位按2位
         return 0                                                # 整数显示（#,##0 等）
     def _display_equivalent(self,old_cell,new_cell,old_sheet,new_sheet,old_val=None,new_val=None):
         # 两格值严格不等时，按 Excel 显示精度判定是否实质一致（跨版本保存的 ulp 浮点尾差豁免）
@@ -2376,7 +2377,7 @@ class DiffViewer:
         tree_frame=tb.Frame(root,padding=(5,0)); tree_frame.pack(fill='both',expand=True); tree_frame.columnconfigure(0,weight=1); tree_frame.rowconfigure(0,weight=1)
         self.tree=tb.Treeview(tree_frame,columns=('action','address','type'),show='tree headings',bootstyle=PRIMARY)
         self.tree.heading('#0',text='Sheet / 差异项'); self.tree.heading('action',text='收起',command=self._toggle_all_nodes); self.tree.heading('address',text='位置'); self.tree.heading('type',text='类型')
-        self.tree.column('#0',width=250,minwidth=250); self.tree.column('action',width=60,minwidth=60,anchor='center',stretch=False); self.tree.column('address',width=130,minwidth=0,anchor='center',stretch=True); self.tree.column('type',width=140,minwidth=0,anchor='center',stretch=True)
+        self.tree.column('#0',width=250,minwidth=200); self.tree.column('action',width=60,minwidth=60,anchor='center',stretch=False); self.tree.column('address',width=130,minwidth=0,anchor='center',stretch=True); self.tree.column('type',width=140,minwidth=0,anchor='center',stretch=True)
         self.tree.tag_configure('sheet',foreground='blue'); self.tree.tag_configure('warning_sheet',foreground='red'); self.tree.tag_configure('com_fail',foreground='red')
         try:
             self.root.option_add('*TScrollbar.width',22)
@@ -2410,12 +2411,12 @@ class DiffViewer:
             try:
                 aw = self.tree.column('address', 'width')
                 tw = self.tree.column('type', 'width')
-                if aw <= 10 and tw <= 10:
+                if aw <= 1 and tw <= 1:
                     if self.tree.column('#0', 'minwidth') != 80:
                         self.tree.column('#0', minwidth=80)
                 else:
-                    if self.tree.column('#0', 'minwidth') != 250:
-                        self.tree.column('#0', minwidth=250)
+                    if self.tree.column('#0', 'minwidth') != 200:
+                        self.tree.column('#0', minwidth=200)
             except Exception:
                 pass
         self.root.bind('<Configure>', _on_root_resize, add='+')
@@ -2776,7 +2777,11 @@ class DiffViewer:
             app=wb.Application
             try: ws=wb.Worksheets(sheet_name)
             except Exception as e: return False,f"工作表不存在：{sheet_name}（{e}）"
-            ws.Activate(); col=''.join(ch for ch in cell_addr if ch.isalpha()); row=''.join(ch for ch in cell_addr if ch.isdigit())
+            ws.Activate()
+            # 提取第一个单元格用于滚动定位（兼容范围地址如 D29:G29）
+            first_addr = cell_addr.split(':')[0] if ':' in cell_addr else cell_addr
+            col=''.join(ch for ch in first_addr if ch.isalpha())
+            row=''.join(ch for ch in first_addr if ch.isdigit())
             if not col or not row: return False,f"无效单元格地址：{cell_addr}"
             app.ActiveWindow.ScrollRow=int(row); app.ActiveWindow.ScrollColumn=column_index_from_string(col); ws.Range(cell_addr).Select(); return 'opened',None
         except Exception as e: return False,str(e)
@@ -2787,8 +2792,7 @@ class DiffViewer:
         if not info or info['type']!='cell': return
         d=info['data']; sheet=d.get('sheet'); addr=d.get('address')
         if not sheet or not addr: return
-        if ':' in addr: addr=addr.split(':')[0]
-        if not re.match(r'^[A-Za-z]+[0-9]+$',addr): self.log(f"跳过跳转：无效地址 {addr}"); return
+        if not re.match(r'^[A-Za-z]+[0-9]+(:[A-Za-z]+[0-9]+)?$',addr): self.log(f"跳过跳转：无效地址 {addr}"); return
         def _ensure(path,label):
             ok,err=self.jump_to_excel(path,sheet,addr)
             if ok=='opened': return True
