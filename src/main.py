@@ -1935,6 +1935,11 @@ class ExcelCOMVerifier:
         try:
             old_ws = self.old_wb.Worksheets(sheet)
             new_ws = self.new_wb.Worksheets(sheet)
+            # 激活工作表以强制 Excel 解析主题字体/颜色等延迟属性，防止 COM 读取到未解析的值
+            try: old_ws.Activate()
+            except Exception: pass
+            try: new_ws.Activate()
+            except Exception: pass
             old_r = old_ws.Range(addr)
             new_r = new_ws.Range(addr)
         except Exception as e:
