@@ -10,7 +10,7 @@ from lxml import etree
 
 NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 PROGRAM_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
-VERSION = "v3.53"
+VERSION = "v3.54"
 
 DEFAULT_CHECK_OPTIONS = {
     'value': True, 'formula': True, 'rich_text': True, 'font': True,
@@ -1617,12 +1617,12 @@ class OpenpyxlComparer:
                 if op and op in self._CF_OP_MAP: cond+='（'+self._CF_OP_MAP[op]+'）'
                 dxf_obj=getattr(r,'dxf',None)
                 has_fmt=bool(dxf_obj is not None and (getattr(dxf_obj,'fill',None) is not None or getattr(dxf_obj,'font',None) is not None))
-                out.append({'cond':cond,'priority':getattr(r,'priority','?'),
+                out.append({'cond':cond,
                             'formula':str(f) if f is not None else '',
                             'dxf':self._cf_dxf_brief(dxf_obj),'has_fmt':has_fmt,
                             'stop':bool(getattr(r,'stopIfTrue',False))})
             except Exception:
-                out.append({'cond':'?','priority':'?','formula':'','dxf':'?','has_fmt':False,'stop':False})
+                out.append({'cond':'?','formula':'','dxf':'?','has_fmt':False,'stop':False})
         return out
 
     def _cf_rule_diffs(self, old_rules, new_rules):
@@ -1632,19 +1632,18 @@ class OpenpyxlComparer:
         for i in range(max(len(o),len(n))):
             ro=o[i] if i<len(o) else None; rn=n[i] if i<len(n) else None
             if ro is None:
-                parts.append(f"新增规则{i+1}[{rn['cond']}/优先级{rn['priority']}] 公式{rn['formula'] or '无'} {rn['dxf']}"+('，为真则停止' if rn['stop'] else '')); continue
+                parts.append(f"新增规则{i+1}[{rn['cond']}] 公式{rn['formula'] or '无'} {rn['dxf']}"+('，为真则停止' if rn['stop'] else '')); continue
             if rn is None:
-                parts.append(f"删除规则{i+1}[{ro['cond']}/优先级{ro['priority']}] 公式{ro['formula'] or '无'} {ro['dxf']}"+('，为真则停止' if ro['stop'] else '')); continue
+                parts.append(f"删除规则{i+1}[{ro['cond']}] 公式{ro['formula'] or '无'} {ro['dxf']}"+('，为真则停止' if ro['stop'] else '')); continue
             if ro==rn: continue
             sub=[]
             if ro['cond']!=rn['cond']: sub.append(f"条件{ro['cond']}→{rn['cond']}")
-            if str(ro['priority'])!=str(rn['priority']): sub.append(f"优先级{ro['priority']}→{rn['priority']}")
             if ro['formula']!=rn['formula']: sub.append(f"公式{ro['formula'] or '无'}→{rn['formula'] or '无'}")
             # 新版有填充/字体对象但读不出颜色（openpyxl 解析主题色失败）时，跳过格式对比避免误报
             if ro['dxf']!=rn['dxf'] and not (rn['has_fmt'] and rn['dxf'] in ('无格式','?')):
                 sub.append(f"格式{ro['dxf']}→{rn['dxf']}")
             if ro['stop']!=rn['stop']: sub.append('勾消为真则停止' if ro['stop'] else '勾选为真则停止')
-            parts.append(f"规则{i+1}[{rn['cond']}/优先级{rn['priority']}] "+'，'.join(sub))
+            parts.append(f"规则{i+1}[{rn['cond']}] "+'，'.join(sub))
         return '；'.join(parts)
 
     def _compare_by_check_type(self, check_type, old_cell, new_cell, options=None, old_ws=None, new_ws=None, address=None, sheet_name='', new_address=None, new_sheet_name=''):
@@ -2365,19 +2364,19 @@ class DiffViewer:
         top_in=tb.Frame(top); top_in.pack(anchor='center')
         tb.Label(top_in,text="置顶").pack(anchor='center'); tb.Checkbutton(top_in,variable=self.topmost,command=self.toggle_topmost,bootstyle="round-toggle").pack(anchor='center')
         self.start_btn=tb.Button(toolbar,text="常规差异\n对比",bootstyle=INFO,width=9,command=self.start_compare); self.start_btn.grid(row=0,column=1,rowspan=2,sticky='nsew',padx=2,pady=1)
-        self.config_btn=tb.Button(toolbar,text="导入\n规则",bootstyle="outline-primary",width=7,command=self.load_check_project); self.config_btn.grid(row=0,column=2,rowspan=2,sticky='nsew',padx=2,pady=1)
-        self.project_btn=tb.Button(toolbar,text="进阶检查\n配置",bootstyle="outline-primary",width=9,command=self.open_project_dialog); self.project_btn.grid(row=0,column=3,rowspan=2,sticky='nsew',padx=2,pady=1)
+        self.config_btn=tb.Button(toolbar,text="高级\n审核",bootstyle="outline-primary",width=7,command=self.load_check_project); self.config_btn.grid(row=0,column=2,rowspan=2,sticky='nsew',padx=2,pady=1)
+        self.project_btn=tb.Button(toolbar,text="高级审核\n规则配置",bootstyle="outline-primary",width=9,command=self.open_project_dialog); self.project_btn.grid(row=0,column=3,rowspan=2,sticky='nsew',padx=2,pady=1)
         self.settings_btn=tb.Button(toolbar,text="常规差异\n检测设置",bootstyle="outline",width=9,command=self.open_check_options); self.settings_btn.grid(row=0,column=4,rowspan=2,sticky='nsew',padx=2,pady=1)
         tb.Separator(toolbar,orient='vertical').grid(row=0,column=5,rowspan=2,sticky='ns',padx=8)
         path_frame=tb.Frame(toolbar); path_frame.grid(row=0,column=6,rowspan=2,sticky='nsew',padx=(0,10)); path_frame.columnconfigure(1,weight=1)
-        tb.Label(path_frame,text="参考报告:").grid(row=0,column=0,sticky='w',padx=(0,5),pady=2); self.old_entry=tb.Entry(path_frame,textvariable=self.old_path); self.old_entry.grid(row=0,column=1,sticky='ew',pady=2); tb.Button(path_frame,text="浏览",bootstyle="light",width=6,command=lambda:self.browse(self.old_path)).grid(row=0,column=2,padx=(5,0),pady=2)
-        tb.Label(path_frame,text="待检报告:").grid(row=1,column=0,sticky='w',padx=(0,5),pady=2); self.new_entry=tb.Entry(path_frame,textvariable=self.new_path); self.new_entry.grid(row=1,column=1,sticky='ew',pady=2); tb.Button(path_frame,text="浏览",bootstyle="light",width=6,command=lambda:self.browse(self.new_path)).grid(row=1,column=2,padx=(5,0),pady=2)
+        tb.Label(path_frame,text="参考报告:").grid(row=0,column=0,sticky='w',padx=(0,5),pady=2); self.old_entry=tb.Entry(path_frame,textvariable=self.old_path); self.old_entry.grid(row=0,column=1,sticky='ew',pady=2); tb.Button(path_frame,text="浏览",bootstyle="outline-primary",width=6,command=lambda:self.browse(self.old_path)).grid(row=0,column=2,padx=(5,0),pady=2)
+        tb.Label(path_frame,text="待检报告:").grid(row=1,column=0,sticky='w',padx=(0,5),pady=2); self.new_entry=tb.Entry(path_frame,textvariable=self.new_path); self.new_entry.grid(row=1,column=1,sticky='ew',pady=2); tb.Button(path_frame,text="浏览",bootstyle="outline-primary",width=6,command=lambda:self.browse(self.new_path)).grid(row=1,column=2,padx=(5,0),pady=2)
         toolbar.columnconfigure(6,weight=1)
         self.progress=tb.Progressbar(root,mode='determinate',bootstyle="success"); self.progress.pack(fill='x',padx=5,pady=(0,5))
         tree_frame=tb.Frame(root,padding=(5,0)); tree_frame.pack(fill='both',expand=True); tree_frame.columnconfigure(0,weight=1); tree_frame.rowconfigure(0,weight=1)
         self.tree=tb.Treeview(tree_frame,columns=('action','address','type'),show='tree headings',bootstyle=PRIMARY)
         self.tree.heading('#0',text='Sheet / 差异项'); self.tree.heading('action',text='收起',command=self._toggle_all_nodes); self.tree.heading('address',text='位置'); self.tree.heading('type',text='类型')
-        self.tree.column('#0',width=250,minwidth=200); self.tree.column('action',width=60,minwidth=60,anchor='center',stretch=False); self.tree.column('address',width=130,minwidth=130,anchor='center',stretch=False); self.tree.column('type',width=140,minwidth=120,anchor='center',stretch=False)
+        self.tree.column('#0',width=250,minwidth=250); self.tree.column('action',width=60,minwidth=60,anchor='center',stretch=False); self.tree.column('address',width=130,minwidth=0,anchor='center',stretch=True); self.tree.column('type',width=140,minwidth=0,anchor='center',stretch=True)
         self.tree.tag_configure('sheet',foreground='blue'); self.tree.tag_configure('warning_sheet',foreground='red'); self.tree.tag_configure('com_fail',foreground='red')
         try:
             self.root.option_add('*TScrollbar.width',22)
@@ -2395,8 +2394,8 @@ class DiffViewer:
         self.tree.configure(yscrollcommand=sb.set); self.tree.grid(row=0,column=0,sticky='nsew'); sb.grid(row=0,column=1,sticky='ns')
         self.tree.bind('<<TreeviewSelect>>',self.on_tree_select); self.tree.bind('<Double-1>',self.on_tree_double_click); self.tree.bind('<Button-1>',self.on_tree_click)
         bottom=tb.Frame(root,padding=5); bottom.pack(fill='x'); bottom.columnconfigure(0,weight=0); bottom.columnconfigure(1,weight=1)
-        df=tb.Labelframe(bottom,text="差异详情",padding=5,bootstyle=INFO); df.grid(row=0,column=0,sticky='nsew',padx=(0,3)); self.detail=tk.Text(df,width=42,height=6,wrap='word',font=("微软雅黑",9),bg='#ffffff',fg='#212529',relief='flat',highlightthickness=1,highlightbackground='#dee2e6',highlightcolor='#0d6efd',padx=5,pady=5); self.detail.pack(fill='both',expand=True)
-        lf=tb.Labelframe(bottom,text="日志",padding=5,bootstyle=SECONDARY); lf.grid(row=0,column=1,sticky='nsew',padx=(3,0)); self.log_text=tk.Text(lf,height=6,wrap='word',font=("微软雅黑",9),bg='#ffffff',fg='#212529',relief='flat',highlightthickness=1,highlightbackground='#dee2e6',highlightcolor='#0d6efd',padx=5,pady=5); self.log_text.pack(fill='both',expand=True)
+        df=tb.Labelframe(bottom,text="差异详情",padding=5,bootstyle=INFO); df.grid(row=0,column=0,sticky='nsew',padx=(0,3)); df.columnconfigure(0,weight=1); df.rowconfigure(0,weight=1); self.detail=tk.Text(df,width=42,height=6,wrap='word',font=("微软雅黑",9),bg='#ffffff',fg='#212529',relief='flat',highlightthickness=1,highlightbackground='#dee2e6',highlightcolor='#0d6efd',padx=5,pady=5); self.detail.grid(row=0,column=0,sticky='nsew'); detail_sb=tb.Scrollbar(df,orient='vertical',command=self.detail.yview,bootstyle="round"); self.detail.configure(yscrollcommand=detail_sb.set); detail_sb.grid(row=0,column=1,sticky='ns')
+        lf=tb.Labelframe(bottom,text="日志",padding=5,bootstyle=SECONDARY); lf.grid(row=0,column=1,sticky='nsew',padx=(3,0)); lf.columnconfigure(0,weight=1); lf.rowconfigure(0,weight=1); self.log_text=tk.Text(lf,height=6,wrap='word',font=("微软雅黑",9),bg='#ffffff',fg='#212529',relief='flat',highlightthickness=1,highlightbackground='#dee2e6',highlightcolor='#0d6efd',padx=5,pady=5); self.log_text.grid(row=0,column=0,sticky='nsew'); log_sb=tb.Scrollbar(lf,orient='vertical',command=self.log_text.yview,bootstyle="round"); self.log_text.configure(yscrollcommand=log_sb.set); log_sb.grid(row=0,column=1,sticky='ns')
         # 日志着色 tag
         self.log_text.tag_configure('ts',foreground='#9aa0a6',font=("微软雅黑",8))
         self.log_text.tag_configure('log_ok',foreground='#198754')
@@ -2405,6 +2404,21 @@ class DiffViewer:
         self.log_text.tag_configure('log_red_bold',foreground='#dc3545',font=("微软雅黑",9,'bold'))
         self.log_text.tag_configure('log_blue_bold',foreground='#0d6efd',font=("微软雅黑",9,'bold'))
         self.log_text.tag_configure('log_hb',foreground='#6c757d')
+
+        # Sheet列压缩控制：type/address 压完后才允许压缩 #0
+        def _on_root_resize(event):
+            try:
+                aw = self.tree.column('address', 'width')
+                tw = self.tree.column('type', 'width')
+                if aw <= 10 and tw <= 10:
+                    if self.tree.column('#0', 'minwidth') != 80:
+                        self.tree.column('#0', minwidth=80)
+                else:
+                    if self.tree.column('#0', 'minwidth') != 250:
+                        self.tree.column('#0', minwidth=250)
+            except Exception:
+                pass
+        self.root.bind('<Configure>', _on_root_resize, add='+')
         self.diff_items=[]; self.result_data=None; self._modal_busy=False
         self.old_entry.bind('<Enter>',lambda e:self._show_path_tip(e,self.old_path.get()))
         self.old_entry.bind('<Leave>',lambda e:self._hide_path_tip())
@@ -2457,11 +2471,11 @@ class DiffViewer:
         try:
             dlg=CheckProjectDialog(self.root,self.old_path.get(),self.new_path.get(),self.check_project); self._active_modal=dlg
             if dlg.result is not None:
-                self.check_project=dlg.result; self._set_start_btn_text(); self.settings_btn.configure(state='disabled'); self.project_btn.configure(text="进阶检查\n配置"); self.log(f"检查项目已加载：{self.check_project.project_name}，包含 {len(self.check_project.rules)} 条规则")
+                self.check_project=dlg.result; self._set_start_btn_text(); self.settings_btn.configure(state='disabled'); self.project_btn.configure(text="高级审核\n规则配置"); self.log(f"检查项目已加载：{self.check_project.project_name}，包含 {len(self.check_project.rules)} 条规则")
         finally:
             self._active_modal=None; self._modal_busy=False
     def clear_check_project(self):
-        self.check_project=None; self.start_btn.configure(text="常规差异\n对比",bootstyle=INFO,command=self.start_compare,width=9); self.settings_btn.configure(state='normal'); self.config_btn.configure(text="导入\n规则",bootstyle="outline-primary",width=7,command=self.load_check_project); self.project_btn.configure(text="进阶检查\n配置",command=self.open_project_dialog); self.tree.delete(*self.tree.get_children()); self.detail.delete('1.0','end'); self.diff_items=[]; self.result_data=None; self.log("已退出规则检查模式，恢复常规差异对比")
+        self.check_project=None; self.start_btn.configure(text="常规差异\n对比",bootstyle=INFO,command=self.start_compare,width=9); self.settings_btn.configure(state='normal'); self.config_btn.configure(text="高级\n审核",bootstyle="outline-primary",width=7,command=self.load_check_project); self.project_btn.configure(text="高级审核\n规则配置",command=self.open_project_dialog); self.tree.delete(*self.tree.get_children()); self.detail.delete('1.0','end'); self.diff_items=[]; self.result_data=None; self.log("已退出规则检查模式，恢复常规差异对比")
     def load_check_project(self):
         if self._modal_busy: self._raise_modal(); return
         self._modal_busy=True
@@ -2469,7 +2483,7 @@ class DiffViewer:
             dlg=ProjectListDialog(self.root,PROGRAM_DIR); self._active_modal=dlg
             if dlg.result:
                 with open(dlg.result,'r',encoding='utf-8') as f: data=json.load(f)
-                self.check_project=CheckProject.from_dict(data); self._set_start_btn_text(); self.settings_btn.configure(state='disabled'); self.config_btn.configure(text="退出规则\n模式",bootstyle="warning-outline",width=8,command=self.clear_check_project); self.log(f"检查项目已加载：{self.check_project.project_name}，包含 {len(self.check_project.rules)} 条规则")
+                self.check_project=CheckProject.from_dict(data); self._set_start_btn_text(); self.settings_btn.configure(state='disabled'); self.config_btn.configure(text="退出配置\n高级审核",bootstyle="warning-outline",width=8,command=self.clear_check_project); self.log(f"检查项目已加载：{self.check_project.project_name}，包含 {len(self.check_project.rules)} 条规则")
         except Exception as e: messagebox.showerror("错误",f"打开配置列表失败：{str(e)}")
         finally:
             self._active_modal=None; self._modal_busy=False
