@@ -11,7 +11,7 @@ from lxml import etree
 
 NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 PROGRAM_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
-VERSION = "v3.69"
+VERSION = "v3.70"
 
 DEFAULT_CHECK_OPTIONS = {
     'value': True, 'formula': True, 'rich_text': True, 'font': True,
@@ -926,8 +926,12 @@ class DataLocator:
                     v=ws.cell(row,col).value
                     if v is not None and text in str(v).strip(): return (row,col)
         return None
+    @staticmethod
+    def _merge_search_in(anchor_cfg, search_in):
+        if not search_in or search_in == 'all': return anchor_cfg or {}
+        cfg = dict(anchor_cfg or {}); cfg.setdefault('search_in', search_in); return cfg
     def _locate_offset(self, ws, rule):
-        anchor = self._find_anchor(ws, rule.get('anchor',{}))
+        anchor = self._find_anchor(ws, self._merge_search_in(rule.get('anchor',{}), rule.get('search_in','')))
         if not anchor: return {'error': f'Anchor "{rule.get("anchor",{}).get("text")}" not found'}
         tr = anchor[0] + rule.get('target',{}).get('row_offset',0)
         tc = anchor[1] + rule.get('target',{}).get('col_offset',0)
@@ -1045,18 +1049,178 @@ class PluginManager:
                 if log_callback: log_callback(f" [{plugin.name}] {rule_name} 检查失败: {e}")
         return results
 
+class AdvancedEngine:
+    name=""; description=""
+    def __init__(self, config=None): self.config=config or {}
+    def run(self, new_wb, rule, log_cb=None): return []
+
+class FileNameCheckEngine(AdvancedEngine):
+    name="filename_check"; description="文件名一致性"
+    def run(self, new_wb, rule, log_cb=None):
+        import math
+        fmt=self.config.get('format_template',''); mappings=self.config.get('field_mappings',[])
+        if not fmt or not mappings: return []
+        fname=os.path.splitext(os.path.basename(new_wb.filename if hasattr(new_wb,'filename') and new_wb.filename else ''))[0]
+        if not fname: return []
+        filled=fmt
+        alerts=[]
+        for m in mappings:
+            field=m.get('field',''); sheet=m.get('sheet',''); cell_addr=m.get('cell','')
+            if not field or not sheet or not cell_addr: continue
+            if sheet not in new_wb.sheetnames: continue
+            try:
+                col_str=''.join(ch for ch in cell_addr if ch.isalpha())
+                row_str=''.join(ch for ch in cell_addr if ch.isdigit())
+                if not col_str or not row_str: continue
+                val=new_wb[sheet].cell(int(row_str),column_index_from_string(col_str)).value
+                val_str=str(val).strip() if val is not None else ''
+                filled=filled.replace('{'+field+'}', val_str)
+            except Exception as e:
+                if log_cb: log_cb(f" [filename_check] {field}: {e}")
+        if filled != fname:
+            first=mappings[0] if mappings else {}
+            alerts.append({'sheet':first.get('sheet',''),'address':first.get('cell','A1'),'type':'文件名一致性',
+                'desc':f'文件名不匹配: 实际 "{fname}" ≠ 模板填充 "{filled}" (模板: {fmt})','advanced_check':True})
+        return alerts
+
+class SpecialReminderEngine(AdvancedEngine):
+    name="special_reminder"; description="特殊提醒"
+    def run(self, new_wb, rule, log_cb=None):
+        from openpyxl.utils import get_column_letter as gcl
+        sheet=self.config.get('sheet',''); desc_text=self.config.get('description','需人工复核')
+        trigger=self.config.get('trigger','always')
+        threshold=self.config.get('threshold')
+        anchor_cfg=self.config.get('anchor',{}); target_cfg=self.config.get('target',{})
+        if not sheet or sheet not in new_wb.sheetnames: return []
+        ws=new_wb[sheet]
+        from openpyxl.utils import column_index_from_string as cifs, get_column_letter
+        anchor_text=anchor_cfg.get('text','').strip()
+        ar=None
+        if anchor_text:
+            for r in range(1,(ws.max_row or 1)+1):
+                for c in range(1,(ws.max_column or 1)+1):
+                    v=ws.cell(r,c).value
+                    if v is not None and anchor_text in str(v).strip(): ar=(r,c); break
+                if ar: break
+        if not ar: return []
+        ro=target_cfg.get('row_offset',0); co=target_cfg.get('col_offset',0)
+        rc=target_cfg.get('row_count',1); cc=target_cfg.get('col_count',1)
+        sr=ar[0]+ro; sc=ar[1]+co
+        r2=sr+max(rc,1)-1 if rc>=0 else sr
+        c2=sc+max(cc,1)-1 if cc>=0 else sc
+        r1=min(sr,r2); r2=max(sr,r2); c1=min(sc,c2); c2=max(sc,c2)
+        alerts=[]
+        for r in range(r1,r2+1):
+            for c in range(c1,c2+1):
+                cell=ws.cell(r,c); v=cell.value
+                hit=False
+                if trigger=='always': hit=True
+                elif trigger=='nonempty': hit=v is not None and str(v).strip()!=''
+                elif trigger=='gt': hit=v is not None and isinstance(v,(int,float)) and threshold is not None and v>float(threshold)
+                elif trigger=='lt': hit=v is not None and isinstance(v,(int,float)) and threshold is not None and v<float(threshold)
+                if hit:
+                    addr=f"{get_column_letter(c)}{r}"
+                    alerts.append({'sheet':sheet,'address':addr,'type':'特殊提醒',
+                        'desc':f'{desc_text} [{addr}: {v}]','advanced_check':True})
+        return alerts
+
+class DataTrendEngine(AdvancedEngine):
+    name="data_trend"; description="数据趋势"
+    def run(self, new_wb, rule, log_cb=None):
+        import math, statistics
+        from openpyxl.utils import get_column_letter
+        cfg=self.config
+        cur_sheet=cfg.get('current_sheet',''); hist_sheet=cfg.get('history_sheet','')
+        if not cur_sheet or cur_sheet not in new_wb.sheetnames: return []
+        if not hist_sheet or hist_sheet not in new_wb.sheetnames: return []
+        def _collect(ws_name, acfg, tcfg):
+            ws=new_wb[ws_name]; vals=[]
+            anchor_text=acfg.get('text','').strip()
+            ar=None
+            if anchor_text:
+                for r in range(1,(ws.max_row or 1)+1):
+                    for c in range(1,(ws.max_column or 1)+1):
+                        v=ws.cell(r,c).value
+                        if v is not None and anchor_text in str(v).strip(): ar=(r,c); break
+                    if ar: break
+            if not ar: ar=(1,1)
+            ro=tcfg.get('row_offset',0); co=tcfg.get('col_offset',0)
+            rc=tcfg.get('row_count',1); cc=tcfg.get('col_count',1)
+            sr=ar[0]+ro; sc=ar[1]+co
+            r1=sr; r2=sr+max(rc,1)-1 if rc>=0 else sr
+            c1=sc; c2=sc+max(cc,1)-1 if cc>=0 else sc
+            r1,r2=min(r1,r2),max(r1,r2); c1,c2=min(c1,c2),max(c1,c2)
+            for r in range(r1,r2+1):
+                for c in range(c1,c2+1):
+                    v=ws.cell(r,c).value
+                    if isinstance(v,(int,float)): vals.append(float(v))
+            start_addr=f"{get_column_letter(c1)}{r1}"
+            return vals, (cur_sheet, start_addr)
+        cur_vals, cur_info=_collect(cur_sheet, cfg.get('current_anchor',{}), cfg.get('current_target',{}))
+        hist_vals, _=_collect(hist_sheet, cfg.get('history_anchor',{}), cfg.get('history_target',{}))
+        if not cur_vals: return []
+        alerts=[]
+        mt=cfg.get('metric_thresholds',{})
+        cur_mean=statistics.mean(cur_vals); cur_std=statistics.pstdev(cur_vals) if len(cur_vals)>1 else 0
+        cur_max=max(cur_vals); cur_min=min(cur_vals)
+        sheet=cur_sheet; addr=cur_info[1] if cur_info else 'A1'
+        def _add(metric_name, val, desc):
+            alerts.append({'sheet':sheet,'address':addr,'type':'数据趋势',
+                'desc':f'{metric_name}: {val} {desc}','advanced_check':True})
+        mr=mt.get('mean_range',[])
+        if len(mr)==2 and (cur_mean<float(mr[0]) or cur_mean>float(mr[1])):
+            _add('均值',f'{cur_mean:.4f}',f'超出管制范围 [{mr[0]}~{mr[1]}]')
+        sr=mt.get('stddev_range',[])
+        if len(sr)==2 and (cur_std<float(sr[0]) or cur_std>float(sr[1])):
+            _add('标准差',f'{cur_std:.4f}',f'超出管制范围 [{sr[0]}~{sr[1]}]')
+        if 'max_limit' in mt and mt['max_limit']!='' and cur_max>float(mt['max_limit']):
+            _add('最大值',f'{cur_max:.4f}',f'> 上限 {mt["max_limit"]}')
+        if 'min_limit' in mt and mt['min_limit']!='' and cur_min<float(mt['min_limit']):
+            _add('最小值',f'{cur_min:.4f}',f'< 下限 {mt["min_limit"]}')
+        usl=mt.get('spec_usl',''); lsl=mt.get('spec_lsl','')
+        cpk_min=mt.get('cpk_min','')
+        if usl!='' and lsl!='' and cur_std>0:
+            cpk=min((float(usl)-cur_mean)/(3*cur_std),(cur_mean-float(lsl))/(3*cur_std))
+            if cpk_min!='' and cpk<float(cpk_min):
+                _add('CPK',f'{cpk:.2f}',f'< 最低要求 {cpk_min}')
+        if hist_vals and cfg.get('t_test',False):
+            alpha=float(cfg.get('alpha',0.05))
+            h_mean=statistics.mean(hist_vals); h_std=statistics.pstdev(hist_vals) if len(hist_vals)>1 else 0
+            n1,n2=len(cur_vals),len(hist_vals)
+            if n1>1 and n2>1 and cur_std>0 and h_std>0:
+                se=math.sqrt(cur_std**2/n1 + h_std**2/n2)
+                if se>0:
+                    t_stat=abs(cur_mean-h_mean)/se
+                    df=n1+n2-2
+                    p_approx=2*math.exp(-0.717*t_stat-0.416*t_stat**2/max(df,1)) if t_stat<10 else 0.0001
+                    p_approx=max(0.0001,min(1.0,p_approx))
+                    if p_approx<alpha:
+                        _add('t检验',f'p≈{p_approx:.4f}',f'< α={alpha}，与历史数据存在显著差异 (待检均值{cur_mean:.4f} vs 历史均值{h_mean:.4f})')
+        return alerts
+
+ADVANCED_ENGINE_REGISTRY={'filename_check':FileNameCheckEngine,'special_reminder':SpecialReminderEngine,'data_trend':DataTrendEngine}
+
 class CheckItemConfig:
     def __init__(self, check_type="value", enabled=True, expect="same", options=None):
         self.check_type=check_type; self.enabled=enabled; self.expect=expect; self.options=options or {}
     def to_dict(self): return {"check_type":self.check_type,"enabled":self.enabled,"expect":self.expect,"options":self.options}
     @classmethod
     def from_dict(cls, data): return cls(data.get("check_type","value"),data.get("enabled",True),data.get("expect","same"),data.get("options",{}))
-class CheckRule:
-    def __init__(self, rule_name="", data_source=None, checks=None):
-        self.rule_name=rule_name; self.data_source=data_source or {}; self.checks=checks or []
-    def to_dict(self): return {"rule_name":self.rule_name,"data_source":self.data_source,"checks":[c.to_dict() for c in self.checks]}
+class AdvancedEngineConfig:
+    def __init__(self, engine_type='', enabled=False, config=None):
+        self.engine_type=engine_type; self.enabled=enabled; self.config=config or {}
+    def to_dict(self): return {"engine_type":self.engine_type,"enabled":self.enabled,"config":self.config}
     @classmethod
-    def from_dict(cls, data): return cls(data.get("rule_name",""),data.get("data_source",{}),[CheckItemConfig.from_dict(cd) for cd in data.get("checks",[])])
+    def from_dict(cls, data): return cls(data.get("engine_type",""),data.get("enabled",False),data.get("config",{}))
+class CheckRule:
+    def __init__(self, rule_name="", data_source=None, checks=None, advanced_engines=None):
+        self.rule_name=rule_name; self.data_source=data_source or {}; self.checks=checks or []; self.advanced_engines=advanced_engines or []
+    def to_dict(self): return {"rule_name":self.rule_name,"data_source":self.data_source,"checks":[c.to_dict() for c in self.checks],"advanced_engines":[e.to_dict() for e in self.advanced_engines]}
+    @classmethod
+    def from_dict(cls, data):
+        obj=cls(data.get("rule_name",""),data.get("data_source",{}),[CheckItemConfig.from_dict(cd) for cd in data.get("checks",[])])
+        obj.advanced_engines=[AdvancedEngineConfig.from_dict(ed) for ed in data.get("advanced_engines",[])]
+        return obj
 class CheckProject:
     def __init__(self, project_name="", description="", version="1.0", rules=None):
         self.project_name=project_name; self.description=description; self.version=version; self.rules=rules or []
@@ -1183,7 +1347,26 @@ class OpenpyxlComparer:
             self.progress(85,"执行数据检查插件..."); self._buf_log(f"执行 {len(self.plugin_manager.plugins)} 个检查插件..."); self._flush_log(force=True)
             for diff in self.plugin_manager.run_checks(old_wb,new_wb,self._buf_log):
                 self.diffs.append({'sheet':'🔍 数据检查','address':diff.get('rule_name',''),'type':diff['type'],'desc':diff['desc']})
-        if self.check_project: self.progress(90,"执行进阶规则过滤..."); self._apply_rule_filter(self.diffs,old_wb,new_wb)
+        if self.check_project:
+            self._run_advanced_engines(new_wb)
+            self.progress(90,"执行进阶规则过滤..."); self._apply_rule_filter(self.diffs,old_wb,new_wb)
+    def _run_advanced_engines(self, new_wb):
+        if not self.check_project: return
+        for rule in self.check_project.rules:
+            for ecfg in rule.advanced_engines:
+                if not ecfg.enabled: continue
+                cls=ADVANCED_ENGINE_REGISTRY.get(ecfg.engine_type)
+                if not cls: continue
+                engine=cls(ecfg.config)
+                try:
+                    for alert in engine.run(new_wb, rule, self._buf_log):
+                        self.diffs.append({'sheet':alert.get('sheet',''),'address':alert.get('address',''),
+                            'type':alert.get('type','高级检查'),'desc':alert.get('desc',''),
+                            'advanced_check':True})
+                    self._buf_log(f" [高级检查] {ecfg.engine_type} 完成")
+                except Exception as e:
+                    self._buf_log(f" [高级检查] {ecfg.engine_type} 失败: {e}")
+        self._flush_log(force=True)
     def _apply_rule_filter(self, diffs, old_wb, new_wb):
         diff_type_map={'内容变化':'value','公式变化':'formula','字体变化':'font','填充变化':'fill','边框变化':'border','对齐变化':'alignment','数字格式变化':'number_format','合并新增':'merged_cells','合并删除':'merged_cells','行高变化':'row_height','列宽变化':'col_width','图片新增':'images','图片变动':'images','图片尺寸变化':'images','条件格式新增':'conditional_format','条件格式删除':'conditional_format','条件格式修改':'conditional_format','条件格式变化':'conditional_format','富文本变化':'rich_text','单元格新增':'value','单元格删除':'value'}
         rule_addr_map={}; shift_new_map={}; shift_old_map={}; locator=DataLocator()
@@ -1195,8 +1378,9 @@ class OpenpyxlComparer:
                 sheet=ds.get('sheet','')
                 if sheet not in old_wb.sheetnames or sheet not in new_wb.sheetnames: continue
                 hdr_t=ds.get('header_target',{}); rows=ds.get('rows','')
-                o_loc=locator._range_cfg(old_wb[sheet], ds.get('anchor',{}), hdr_t, '标题行范围')
-                n_loc=locator._range_cfg(new_wb[sheet], ds.get('anchor',{}), hdr_t, '标题行范围')
+                o_ac=locator._merge_search_in(ds.get('anchor',{}), ds.get('search_in',''))
+                o_loc=locator._range_cfg(old_wb[sheet], o_ac, hdr_t, '标题行范围')
+                n_loc=locator._range_cfg(new_wb[sheet], o_ac, hdr_t, '标题行范围')
                 if 'error' in o_loc or 'error' in n_loc:
                     self._buf_log(f"规则[{rule.rule_name}] 标题区域定位失败: {o_loc.get('error') or n_loc.get('error')}"); self._flush_log(force=True); continue
                 rowset=self._parse_row_spec(rows)
@@ -1274,9 +1458,9 @@ class OpenpyxlComparer:
                     # same 期望：shift 配对比较一致才豁免；different 期望：配对比较 round 后确实有差异才豁免
                     # （公式浮点尾差经新端数值精度 round 后不判差异；round 后一致=实质未变，不满足"期望不同"，不豁免）
                     if (check.expect=='same' and diff is None) or (check.expect=='different' and diff is not None):
-                        d['rule_pass']=True; d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=diff or '一致'; matched=True; break
+                        d['rule_pass']=True; d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=self._build_diff_desc(check_type,old_cell,new_cell,diff,True,self); matched=True; break
                     else:
-                        d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=diff; matched=True; break
+                        d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=self._build_diff_desc(check_type,old_cell,new_cell,diff,False,self); matched=True; break
                 if matched: break
             if matched: continue
             for rule in hits:
@@ -1290,9 +1474,24 @@ class OpenpyxlComparer:
                     diff=self._compare_by_check_type(check_type,old_cell,new_cell,check.options,old_ws,new_ws,d['address'],d['sheet'])
                     # 同地址规则：same 期望比较一致才豁免；different 期望 round 后确实有差异才豁免
                     if (check.expect=='same' and diff is None) or (check.expect=='different' and diff is not None):
-                        d['rule_pass']=True; d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=diff or '一致'; break
-                    else: d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=diff; break
+                        d['rule_pass']=True; d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=self._build_diff_desc(check_type,old_cell,new_cell,diff,True,self); break
+                    else: d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=self._build_diff_desc(check_type,old_cell,new_cell,diff,False,self); break
                 if d.get('rule_pass'): break
+    @staticmethod
+    def _build_diff_desc(check_type, old_cell, new_cell, diff_result, is_exempted, comparer=None):
+        if diff_result is not None: desc = diff_result
+        elif check_type == 'formula': desc = f"公式: {formula_text(old_cell.value)} → {formula_text(new_cell.value)}"
+        elif comparer and check_type in ('value','number_format'): desc = comparer._format_pair(check_type, old_cell, new_cell)
+        else: desc = f"{old_cell.value} → {new_cell.value}"
+        if is_exempted: desc += "（已豁免）"
+        return desc
+    def _format_pair(self, check_type, old_cell, new_cell):
+        ov, nv = old_cell.value, new_cell.value
+        if check_type == 'formula': return f"公式: {formula_text(ov)} → {formula_text(nv)}"
+        if check_type == 'number_format':
+            nf1=self._get_actual_number_format(old_cell,'old'); nf2=self._get_actual_number_format(new_cell,'new')
+            return f"数字格式: {format_numfmt_readable(nf1)} → {format_numfmt_readable(nf2)}"
+        return f"{ov} → {nv}"
     @staticmethod
     def _parse_row_spec(spec):
         """'3,5-7,13-14' → {3,5,6,7,13,14}；非法返回空集合"""
@@ -2416,6 +2615,147 @@ class CheckProjectDialog(tb.Toplevel):
     def apply_project(self):
         self.project.project_name=self.project_name_var.get(); self.project.version=self.version_var.get(); self.project.description=self.desc_var.get(); self.result=self.project; self.destroy()
 
+class FileNameCheckConfigDialog(tb.Toplevel):
+    def __init__(self, parent, config, sheets):
+        super().__init__(parent); self.title("文件名一致性配置"); self.geometry("500x400"); self.transient(parent); self.result=None
+        self.mappings=config.get('field_mappings',[]); self.sheets=sheets
+        main=tb.Frame(self,padding=15); main.pack(fill='both',expand=True)
+        tb.Label(main,text="模板格式 (用 {字段名} 占位):").pack(anchor='w')
+        self.fmt_var=tk.StringVar(value=config.get('format_template','')); tb.Entry(main,textvariable=self.fmt_var,width=50).pack(fill='x',pady=(2,8))
+        tb.Label(main,text="字段映射 (字段名 → Sheet + 单元格):",font=('微软雅黑',9,'bold')).pack(anchor='w',pady=(4,0))
+        mf=tb.Frame(main); mf.pack(fill='both',expand=True,pady=4)
+        cols=('field','sheet','cell'); self.tv=tb.Treeview(mf,columns=cols,show='headings',height=8)
+        for c,w in [('field',120),('sheet',150),('cell',80)]: self.tv.heading(c,text=c); self.tv.column(c,width=w)
+        self.tv.pack(side='left',fill='both',expand=True); sb=tb.Scrollbar(mf,orient='vertical',command=self.tv.yview); sb.pack(side='right',fill='y'); self.tv.configure(yscrollcommand=sb.set)
+        for m in self.mappings: self.tv.insert('','end',values=(m.get('field',''),m.get('sheet',''),m.get('cell','')))
+        bf=tb.Frame(main); bf.pack(fill='x',pady=4)
+        tb.Label(bf,text="字段:").pack(side='left'); self.f_var=tk.StringVar(); tb.Entry(bf,textvariable=self.f_var,width=10).pack(side='left',padx=2)
+        tb.Label(bf,text="Sheet:").pack(side='left',padx=(8,0)); self.s_var=tk.StringVar(); self.s_cb=tb.Combobox(bf,textvariable=self.s_var,width=14,values=sheets); self.s_cb.pack(side='left',padx=2)
+        tb.Label(bf,text="单元格:").pack(side='left',padx=(8,0)); self.c_var=tk.StringVar(); tb.Entry(bf,textvariable=self.c_var,width=6).pack(side='left',padx=2)
+        tb.Button(bf,text="添加",width=5,command=self._add).pack(side='left',padx=4)
+        tb.Button(bf,text="删除",width=5,command=self._del).pack(side='left',padx=2)
+        btn=tb.Frame(main); btn.pack(fill='x',pady=(8,0))
+        tb.Button(btn,text="确定",bootstyle=PRIMARY,width=8,command=self._ok).pack(side='right',padx=5)
+        tb.Button(btn,text="取消",width=8,command=self.destroy).pack(side='right')
+        center_window(self,parent); self.grab_set(); self.wait_window()
+    def _add(self):
+        f,s,c=self.f_var.get().strip(),self.s_var.get().strip(),self.c_var.get().strip()
+        if f and s and c: self.tv.insert('','end',values=(f,s,c)); self.f_var.set(''); self.c_var.set('')
+    def _del(self):
+        for sel in self.tv.selection(): self.tv.delete(sel)
+    def _ok(self):
+        mappings=[{'field':v[0],'sheet':v[1],'cell':v[2]} for v in self.tv.item(iid)['values'] for iid in [self.tv.get_children()]]
+        mappings=[]
+        for iid in self.tv.get_children():
+            v=self.tv.item(iid)['values']; mappings.append({'field':str(v[0]),'sheet':str(v[1]),'cell':str(v[2])})
+        self.result={'format_template':self.fmt_var.get().strip(),'field_mappings':mappings}; self.destroy()
+
+class SpecialReminderConfigDialog(tb.Toplevel):
+    def __init__(self, parent, config, sheets):
+        super().__init__(parent); self.title("特殊提醒配置"); self.geometry("480x380"); self.transient(parent); self.result=None; self.sheets=sheets
+        main=tb.Frame(self,padding=15); main.pack(fill='both',expand=True)
+        tb.Label(main,text="Sheet:").pack(anchor='w'); self.sheet_var=tk.StringVar(value=config.get('sheet',''))
+        sr=tb.Frame(main); sr.pack(fill='x',pady=2); self.s_cb=tb.Combobox(sr,textvariable=self.sheet_var,width=20,values=sheets); self.s_cb.pack(side='left')
+        tb.Label(main,text="锚点文字:").pack(anchor='w',pady=(6,0)); self.anchor_var=tk.StringVar(value=config.get('anchor',{}).get('text','')); tb.Entry(main,textvariable=self.anchor_var,width=40).pack(fill='x',pady=2)
+        tb.Label(main,text="偏移: 行").pack(anchor='w',pady=(6,0))
+        of=tb.Frame(main); of.pack(fill='x',pady=2)
+        self.ro_var=tk.StringVar(value=str(config.get('target',{}).get('row_offset',0))); tb.Entry(of,textvariable=self.ro_var,width=6).pack(side='left')
+        tb.Label(of,text="  列").pack(side='left')
+        self.co_var=tk.StringVar(value=str(config.get('target',{}).get('col_offset',0))); tb.Entry(of,textvariable=self.co_var,width=6).pack(side='left')
+        tb.Label(of,text="  行数").pack(side='left')
+        self.rc_var=tk.StringVar(value=str(config.get('target',{}).get('row_count',1))); tb.Entry(of,textvariable=self.rc_var,width=6).pack(side='left')
+        tb.Label(of,text="  列数").pack(side='left')
+        self.cc_var=tk.StringVar(value=str(config.get('target',{}).get('col_count',1))); tb.Entry(of,textvariable=self.cc_var,width=6).pack(side='left')
+        tb.Label(main,text="提醒描述:").pack(anchor='w',pady=(8,0)); self.desc_var=tk.StringVar(value=config.get('description','需人工复核')); tb.Entry(main,textvariable=self.desc_var,width=40).pack(fill='x',pady=2)
+        tb.Label(main,text="触发条件:").pack(anchor='w',pady=(6,0))
+        tf=tb.Frame(main); tf.pack(fill='x',pady=2)
+        self.trigger_var=tk.StringVar(value=config.get('trigger','always'))
+        for val,txt in [('always','始终触发'),('nonempty','任意非空'),('gt','值 >'),('lt','值 <')]:
+            tb.Radiobutton(tf,text=txt,variable=self.trigger_var,value=val).pack(side='left',padx=4)
+        tb.Label(tf,text="阈值:").pack(side='left',padx=(8,0))
+        self.thresh_var=tk.StringVar(value=str(config.get('threshold',''))); tb.Entry(tf,textvariable=self.thresh_var,width=8).pack(side='left')
+        btn=tb.Frame(main); btn.pack(fill='x',pady=(12,0))
+        tb.Button(btn,text="确定",bootstyle=PRIMARY,width=8,command=self._ok).pack(side='right',padx=5)
+        tb.Button(btn,text="取消",width=8,command=self.destroy).pack(side='right')
+        center_window(self,parent); self.grab_set(); self.wait_window()
+    def _ok(self):
+        try: th=float(self.thresh_var.get()) if self.thresh_var.get().strip() else None
+        except: th=None
+        self.result={'sheet':self.sheet_var.get().strip(),'anchor':{'text':self.anchor_var.get().strip()},
+            'target':{'row_offset':int(self.ro_var.get() or 0),'col_offset':int(self.co_var.get() or 0),
+                'row_count':int(self.rc_var.get() or 1),'col_count':int(self.cc_var.get() or 1)},
+            'description':self.desc_var.get().strip(),'trigger':self.trigger_var.get(),'threshold':th}
+        self.destroy()
+
+class DataTrendConfigDialog(tb.Toplevel):
+    def __init__(self, parent, config, sheets):
+        super().__init__(parent); self.title("数据趋势配置"); self.geometry("520x560"); self.transient(parent); self.result=None; self.sheets=sheets
+        main=tb.Frame(self,padding=15); main.pack(fill='both',expand=True)
+        canvas=tk.Canvas(main,highlightthickness=0); sb=ttk.Scrollbar(main,orient='vertical',command=canvas.yview)
+        sf=tb.Frame(canvas); sf.bind("<Configure>",lambda e:canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0,0),window=sf,anchor="nw",width=480); canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left",fill="both",expand=True); sb.pack(side="right",fill="y")
+        # 待检数据
+        tb.Label(sf,text="▸ 待检数据范围",font=('微软雅黑',9,'bold')).pack(anchor='w',pady=(0,2))
+        tb.Label(sf,text="Sheet:").pack(anchor='w'); self.cs_var=tk.StringVar(value=config.get('current_sheet','')); tb.Combobox(sf,textvariable=self.cs_var,width=20,values=sheets).pack(fill='x',pady=1)
+        tb.Label(sf,text="锚点:").pack(anchor='w'); self.ca_var=tk.StringVar(value=config.get('current_anchor',{}).get('text','')); tb.Entry(sf,textvariable=self.ca_var,width=30).pack(fill='x',pady=1)
+        cf=tb.Frame(sf); cf.pack(fill='x',pady=1)
+        tb.Label(cf,text="行偏移:").pack(side='left'); self.cro=tk.StringVar(value=str(config.get('current_target',{}).get('row_offset',0))); tb.Entry(cf,textvariable=self.cro,width=5).pack(side='left',padx=2)
+        tb.Label(cf,text="列偏移:").pack(side='left'); self.cco=tk.StringVar(value=str(config.get('current_target',{}).get('col_offset',0))); tb.Entry(cf,textvariable=self.cco,width=5).pack(side='left',padx=2)
+        tb.Label(cf,text="行数:").pack(side='left'); self.crc=tk.StringVar(value=str(config.get('current_target',{}).get('row_count',1))); tb.Entry(cf,textvariable=self.crc,width=5).pack(side='left',padx=2)
+        tb.Label(cf,text="列数:").pack(side='left'); self.ccc=tk.StringVar(value=str(config.get('current_target',{}).get('col_count',1))); tb.Entry(cf,textvariable=self.ccc,width=5).pack(side='left',padx=2)
+        # 历史数据
+        tb.Label(sf,text="▸ 历史数据范围（同文件）",font=('微软雅黑',9,'bold')).pack(anchor='w',pady=(8,2))
+        tb.Label(sf,text="Sheet:").pack(anchor='w'); self.hs_var=tk.StringVar(value=config.get('history_sheet','')); tb.Combobox(sf,textvariable=self.hs_var,width=20,values=sheets).pack(fill='x',pady=1)
+        tb.Label(sf,text="锚点:").pack(anchor='w'); self.ha_var=tk.StringVar(value=config.get('history_anchor',{}).get('text','')); tb.Entry(sf,textvariable=self.ha_var,width=30).pack(fill='x',pady=1)
+        hf=tb.Frame(sf); hf.pack(fill='x',pady=1)
+        tb.Label(hf,text="行偏移:").pack(side='left'); self.hro=tk.StringVar(value=str(config.get('history_target',{}).get('row_offset',0))); tb.Entry(hf,textvariable=self.hro,width=5).pack(side='left',padx=2)
+        tb.Label(hf,text="列偏移:").pack(side='left'); self.hco=tk.StringVar(value=str(config.get('history_target',{}).get('col_offset',0))); tb.Entry(hf,textvariable=self.hco,width=5).pack(side='left',padx=2)
+        tb.Label(hf,text="行数:").pack(side='left'); self.hrc=tk.StringVar(value=str(config.get('history_target',{}).get('row_count',1))); tb.Entry(hf,textvariable=self.hrc,width=5).pack(side='left',padx=2)
+        tb.Label(hf,text="列数:").pack(side='left'); self.hcc=tk.StringVar(value=str(config.get('history_target',{}).get('col_count',1))); tb.Entry(hf,textvariable=self.hcc,width=5).pack(side='left',padx=2)
+        # 管制阈值
+        mt=config.get('metric_thresholds',{})
+        tb.Label(sf,text="▸ 管制阈值",font=('微软雅黑',9,'bold')).pack(anchor='w',pady=(8,2))
+        mf=tb.Frame(sf); mf.pack(fill='x',pady=1)
+        tb.Label(mf,text="均值范围:").pack(side='left'); self.mn_lo=tk.StringVar(value=str(mt.get('mean_range',['',''])[0])); tb.Entry(mf,textvariable=self.mn_lo,width=6).pack(side='left',padx=1)
+        tb.Label(mf,text="~").pack(side='left'); self.mn_hi=tk.StringVar(value=str(mt.get('mean_range',['',''])[1])); tb.Entry(mf,textvariable=self.mn_hi,width=6).pack(side='left',padx=1)
+        tb.Label(mf,text="标准差:").pack(side='left',padx=(8,0)); self.sd_lo=tk.StringVar(value=str(mt.get('stddev_range',['',''])[0])); tb.Entry(mf,textvariable=self.sd_lo,width=6).pack(side='left',padx=1)
+        tb.Label(mf,text="~").pack(side='left'); self.sd_hi=tk.StringVar(value=str(mt.get('stddev_range',['',''])[1])); tb.Entry(mf,textvariable=self.sd_hi,width=6).pack(side='left',padx=1)
+        mf2=tb.Frame(sf); mf2.pack(fill='x',pady=1)
+        tb.Label(mf2,text="最大值≤:").pack(side='left'); self.max_l=tk.StringVar(value=str(mt.get('max_limit',''))); tb.Entry(mf2,textvariable=self.max_l,width=8).pack(side='left',padx=2)
+        tb.Label(mf2,text="最小值≥:").pack(side='left',padx=(8,0)); self.min_l=tk.StringVar(value=str(mt.get('min_limit',''))); tb.Entry(mf2,textvariable=self.min_l,width=8).pack(side='left',padx=2)
+        # 规格与CPK
+        tb.Label(sf,text="▸ 规格与CPK",font=('微软雅黑',9,'bold')).pack(anchor='w',pady=(8,2))
+        sf2=tb.Frame(sf); sf2.pack(fill='x',pady=1)
+        tb.Label(sf2,text="USL:").pack(side='left'); self.usl=tk.StringVar(value=str(mt.get('spec_usl',''))); tb.Entry(sf2,textvariable=self.usl,width=8).pack(side='left',padx=2)
+        tb.Label(sf2,text="LSL:").pack(side='left',padx=(8,0)); self.lsl=tk.StringVar(value=str(mt.get('spec_lsl',''))); tb.Entry(sf2,textvariable=self.lsl,width=8).pack(side='left',padx=2)
+        tb.Label(sf2,text="CPK≥:").pack(side='left',padx=(8,0)); self.cpk=tk.StringVar(value=str(mt.get('cpk_min',''))); tb.Entry(sf2,textvariable=self.cpk,width=6).pack(side='left',padx=2)
+        # t检验
+        tb.Label(sf,text="▸ 显著性检验",font=('微软雅黑',9,'bold')).pack(anchor='w',pady=(8,2))
+        tf=tb.Frame(sf); tf.pack(fill='x',pady=1)
+        self.ttest_var=tk.BooleanVar(value=config.get('t_test',False)); tb.Checkbutton(tf,text="启用 t 检验",variable=self.ttest_var,bootstyle="round-toggle").pack(side='left')
+        tb.Label(tf,text="α:").pack(side='left',padx=(12,0)); self.alpha_var=tk.StringVar(value=str(config.get('alpha',0.05))); tb.Entry(tf,textvariable=self.alpha_var,width=6).pack(side='left',padx=2)
+        btn=tb.Frame(main); btn.pack(fill='x',pady=(8,0))
+        tb.Button(btn,text="确定",bootstyle=PRIMARY,width=8,command=self._ok).pack(side='right',padx=5)
+        tb.Button(btn,text="取消",width=8,command=self.destroy).pack(side='right')
+        center_window(self,parent); self.grab_set(); self.wait_window()
+    def _to_f(self, v):
+        try: return float(v) if v.strip() else ''
+        except: return ''
+    def _ok(self):
+        mt={'mean_range':[self._to_f(self.mn_lo.get()),self._to_f(self.mn_hi.get())],
+            'stddev_range':[self._to_f(self.sd_lo.get()),self._to_f(self.sd_hi.get())],
+            'max_limit':self._to_f(self.max_l.get()),'min_limit':self._to_f(self.min_l.get()),
+            'spec_usl':self._to_f(self.usl.get()),'spec_lsl':self._to_f(self.lsl.get()),'cpk_min':self._to_f(self.cpk.get())}
+        self.result={'current_sheet':self.cs_var.get().strip(),'current_anchor':{'text':self.ca_var.get().strip()},
+            'current_target':{'row_offset':int(self.cro.get() or 0),'col_offset':int(self.cco.get() or 0),
+                'row_count':int(self.crc.get() or 1),'col_count':int(self.ccc.get() or 1)},
+            'history_sheet':self.hs_var.get().strip(),'history_anchor':{'text':self.ha_var.get().strip()},
+            'history_target':{'row_offset':int(self.hro.get() or 0),'col_offset':int(self.hco.get() or 0),
+                'row_count':int(self.hrc.get() or 1),'col_count':int(self.hcc.get() or 1)},
+            'metric_thresholds':mt,'t_test':self.ttest_var.get(),'alpha':float(self.alpha_var.get() or 0.05)}
+        self.destroy()
+
 class RuleEditorDialog(tb.Toplevel):
     def __init__(self,parent,old_path,new_path,rule=None):
         super().__init__(parent); self.title("编辑规则"); self.geometry("1100x800"); self.transient(parent); self.parent=parent; self.old_path=old_path; self.new_path=new_path; self.result=None; self.rule=rule or CheckRule(); self._build_ui(); self._load_rule_data(); center_window(self,parent)
@@ -2467,6 +2807,28 @@ class RuleEditorDialog(tb.Toplevel):
             lf=tb.Labelframe(sf,text=f"{gname}（共{len(keys)}项）",padding=(8,5)); lf.pack(fill='x',pady=(0,8),padx=5)
             for key in keys:
                 row=tb.Frame(lf); row.pack(fill='x',pady=1); lc=tb.Frame(row); lc.pack(side='left',fill='x',expand=True); var=tk.BooleanVar(value=True); self.check_vars[key]=var; tb.Checkbutton(lc,text=CHECK_OPTION_LABELS[key],variable=var,bootstyle="round-toggle").pack(side='left',anchor='w'); rc=tb.Frame(row); rc.pack(side='right'); tb.Label(rc,text="期望:").pack(side='left',padx=(10,2)); ev=tk.StringVar(value='same'); tb.Combobox(rc,textvariable=ev,values=['same','different'],width=8).pack(side='left'); self.expect_vars[key]=ev
+        adv_lf=tb.Labelframe(sf,text="高级检查（仅待检文件）",padding=(8,5)); adv_lf.pack(fill='x',pady=(0,8),padx=5)
+        self.adv_engine_vars={}; self.adv_engine_configs={}
+        for etype,elabel in [('filename_check','文件名一致性'),('special_reminder','特殊提醒'),('data_trend','数据趋势')]:
+            arow=tb.Frame(adv_lf); arow.pack(fill='x',pady=1)
+            ev=tk.BooleanVar(value=False); self.adv_engine_vars[etype]=ev
+            self.adv_engine_configs[etype]={}
+            tb.Checkbutton(arow,text=elabel,variable=ev,bootstyle="round-toggle").pack(side='left',anchor='w')
+            tb.Button(arow,text="配置",width=5,command=lambda t=etype,l=elabel:self._open_engine_config(t,l)).pack(side='right',padx=(5,0))
+    def _open_engine_config(self, engine_type, label):
+        cfg=self.adv_engine_configs.get(engine_type,{})
+        sheets=[]
+        for p in [self.old_path,self.new_path]:
+            if os.path.isfile(p):
+                try: sheets=get_sheet_names_fast(p); break
+                except: pass
+        if engine_type=='filename_check':
+            dlg=FileNameCheckConfigDialog(self,cfg,sheets); 
+        elif engine_type=='special_reminder':
+            dlg=SpecialReminderConfigDialog(self,cfg,sheets)
+        else:
+            dlg=DataTrendConfigDialog(self,cfg,sheets)
+        if dlg.result is not None: self.adv_engine_configs[engine_type]=dlg.result
     def fetch_sheets(self):
         if not os.path.isfile(self.old_path) and not os.path.isfile(self.new_path): messagebox.showwarning("提示","请先选择有效的Excel文件路径"); return
         self.config(cursor='watch')
@@ -2515,6 +2877,12 @@ class RuleEditorDialog(tb.Toplevel):
             if check.check_type in self.check_vars:
                 self.check_vars[check.check_type].set(bool(check.enabled))
                 self.expect_vars[check.check_type].set(check.expect or 'same')
+        for etype in self.adv_engine_vars:
+            self.adv_engine_vars[etype].set(False); self.adv_engine_configs[etype]={}
+        for ae in getattr(self.rule,'advanced_engines',[]):
+            if ae.engine_type in self.adv_engine_vars:
+                self.adv_engine_vars[ae.engine_type].set(ae.enabled)
+                self.adv_engine_configs[ae.engine_type]=dict(ae.config)
     def _to_int(self, var, default=0):
         try: return int(str(var.get()).strip())
         except Exception: return default
@@ -2531,6 +2899,9 @@ class RuleEditorDialog(tb.Toplevel):
         self.rule.data_source=ds; self.rule.checks=[]
         for key,var in self.check_vars.items():
             if var.get(): self.rule.checks.append(CheckItemConfig(check_type=key,enabled=True,expect=self.expect_vars[key].get()))
+        self.rule.advanced_engines=[]
+        for etype,var in self.adv_engine_vars.items():
+            if var.get(): self.rule.advanced_engines.append(AdvancedEngineConfig(engine_type=etype,enabled=True,config=self.adv_engine_configs.get(etype,{})))
         self.result=self.rule; self.destroy()
     def on_cancel(self): self.result=None; self.destroy()
     def _parse_exclude(self,text):
@@ -2572,7 +2943,7 @@ class DiffViewer:
         self.tree=tb.Treeview(tree_frame,columns=('action','address','type'),show='tree headings',bootstyle=PRIMARY)
         self.tree.heading('#0',text='Sheet / 差异项'); self.tree.heading('action',text='收起',command=self._toggle_all_nodes); self.tree.heading('address',text='位置'); self.tree.heading('type',text='类型')
         self.tree.column('#0',width=340,minwidth=200); self.tree.column('action',width=60,minwidth=60,anchor='center',stretch=False); self.tree.column('address',width=130,minwidth=0,anchor='center',stretch=False); self.tree.column('type',width=130,minwidth=0,anchor='center',stretch=False)
-        self.tree.tag_configure('sheet',foreground='blue'); self.tree.tag_configure('warning_sheet',foreground='red'); self.tree.tag_configure('com_fail',foreground='red'); self.tree.tag_configure('twisty',foreground='#0d6efd')
+        self.tree.tag_configure('sheet',foreground='blue'); self.tree.tag_configure('warning_sheet',foreground='red'); self.tree.tag_configure('com_fail',foreground='red'); self.tree.tag_configure('twisty',foreground='#0d6efd'); self.tree.tag_configure('advanced_check',foreground='#F39C12',font=('微软雅黑',9,'italic'))
         try:
             self.root.option_add('*TScrollbar.width',22)
             _st=ttk.Style(); _st.configure('Vertical.TScrollbar',width=22)
@@ -2947,15 +3318,15 @@ class DiffViewer:
                     merged=self._merge_cell_ranges(dmap[sname]); n_disp=sum(d.get("_merged_count",1) for d in merged)
                     sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,values=('[-]','',''),tags=('sheet','twisty'))
                     for d in merged:
-                        tag=d.get('rule_name') and not d.get('rule_pass')
-                        node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:120],values=('[-]',d['address'],d['type']),tags=(('com_fail',) if d.get('com_confirmed') else (('rule_fail',) if tag else ()))); self.diff_items.append((node,{'type':'cell','data':d}))
+                        atag=('advanced_check',) if d.get('advanced_check') else (('com_fail',) if d.get('com_confirmed') else (('rule_fail',) if d.get('rule_name') and not d.get('rule_pass') else ()))
+                        node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:120],values=('[-]',d['address'],d['type']),tags=atag); self.diff_items.append((node,{'type':'cell','data':d}))
             for sname in dmap:
                 if sname not in self.old_sheet_order:
                     merged=self._merge_cell_ranges(dmap[sname]); n_disp=sum(d.get("_merged_count",1) for d in merged)
                     sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,values=('[-]','',''),tags=('sheet','twisty'))
                     for d in merged:
-                        tag=d.get('rule_name') and not d.get('rule_pass')
-                        node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:120],values=('[-]',d['address'],d['type']),tags=(('com_fail',) if d.get('com_confirmed') else (('rule_fail',) if tag else ()))); self.diff_items.append((node,{'type':'cell','data':d}))
+                        atag=('advanced_check',) if d.get('advanced_check') else (('com_fail',) if d.get('com_confirmed') else (('rule_fail',) if d.get('rule_name') and not d.get('rule_pass') else ()))
+                        node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:120],values=('[-]',d['address'],d['type']),tags=atag); self.diff_items.append((node,{'type':'cell','data':d}))
         if rule_pass:
             pn=self.tree.insert('','end',text=f'✅ 已豁免（可展开）（{len(rule_pass)}）',open=False,values=('[+]','',''),tags=('sheet','twisty')); dmap={}
             for d in rule_pass: dmap.setdefault(d['sheet'],[]).append(d)
@@ -3021,7 +3392,7 @@ class DiffViewer:
             if d.get('rule_name'):
                 lines.append(f"规则: {d['rule_name']}")
                 if d.get('rule_expect'): lines.append(f"期望: {d['rule_expect']}")
-                diff_desc=d.get('rule_diff_desc'); lines.append(f"结果: {diff_desc if diff_desc else ('一致' if d.get('rule_pass') else '存在差异')}")
+                diff_desc=d.get('rule_diff_desc'); lines.append(f"结果: {diff_desc or '无差异描述'}")
             if d.get('com_confirmed'):
                 com_desc = d.get('com_diff_desc', '')
                 lines.append(f"复核: {com_desc}" if com_desc else "复核: 确认差异")
