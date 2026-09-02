@@ -11,7 +11,7 @@ from lxml import etree
 
 NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 PROGRAM_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
-VERSION = "v3.67"
+VERSION = "v3.69"
 
 DEFAULT_CHECK_OPTIONS = {
     'value': True, 'formula': True, 'rich_text': True, 'font': True,
@@ -885,9 +885,9 @@ class DataLocator:
         if sheet_name not in workbook.sheetnames: return {'error':f'Sheet "{sheet_name}" not found'}
         ws = workbook[sheet_name]; mode = rule.get('mode','offset')
         if mode == 'offset': return self._locate_offset(ws, rule)
-        elif mode == 'collect': return self._locate_collect(ws, rule)
         elif mode == 'intersection': return self._locate_intersection(ws, rule)
         elif mode == 'range': return self._locate_range(ws, rule)
+        elif mode == 'collect': return {'error':'collect 模式已移除（range 模式已覆盖，请改用 range）'}
         return {'error':f'Unknown mode: {mode}'}
     @staticmethod
     def _parse_area(area):
@@ -934,23 +934,6 @@ class DataLocator:
         if tr<1 or tc<1: return {'error':'Target out of range'}
         cell = ws.cell(tr,tc)
         return {'address':cell_address(tc,tr),'value':cell.value,'is_formula':isinstance(cell.value,str) and cell.value.startswith('=')}
-    def _locate_collect(self, ws, rule):
-        anchor = self._find_anchor(ws, rule.get('anchor',{}))
-        if not anchor: return {'error': f'Anchor "{rule.get("anchor",{}).get("text")}" not found'}
-        cfg = rule.get('target') or rule.get('collect') or {}
-        direction = cfg.get('direction','down'); start_offset = cfg.get('start_offset',1); max_count = cfg.get('max_count',1000)
-        data = []
-        if direction=='down':
-            for row in range(anchor[0]+start_offset, min(anchor[0]+start_offset+max_count,(ws.max_row or 1)+1)):
-                v=ws.cell(row,anchor[1]).value
-                if v is None: break
-                data.append({'row':row,'value':v})
-        elif direction=='right':
-            for col in range(anchor[1]+start_offset, min(anchor[1]+start_offset+max_count,(ws.max_column or 1)+1)):
-                v=ws.cell(anchor[0],col).value
-                if v is None: break
-                data.append({'col':col,'value':v})
-        return {'anchor_address':cell_address(anchor[1],anchor[0]),'direction':direction,'count':len(data),'values':data}
     def _locate_intersection(self, ws, rule):
         ra = self._find_anchor(ws, {**rule.get('row_anchor',{}), 'search_in': rule.get('row_anchor',{}).get('search_in','all')})
         ca = self._find_anchor(ws, {**rule.get('col_anchor',{}), 'search_in': rule.get('col_anchor',{}).get('search_in','all')})
@@ -963,22 +946,30 @@ class DataLocator:
         if not anchor: return {'error': f'Anchor "{(anchor_cfg or {}).get("text","")}" not found' + (f' ({label})' if label else '')}
         target = target_cfg or {}; start_row = anchor[0] + target.get('row_offset',0); start_col = anchor[1] + target.get('col_offset',0)
         row_count = target.get('row_count',1); col_count = target.get('col_count',1); exclude = target.get('exclude',[])
-        if start_row<1 or start_col<1: return {'error':'Target out of range'}
+        # 语义：start=锚点+offset；count 为含 start 在内的格数，负 count 向反方向延伸
+        # （ro=-1,rc=-3 → start=锚点上1行，向上取3格=锚点上方连续3行；正count行为不变）
+        if row_count >= 0: r1, r2 = start_row, start_row + row_count - 1
+        else:              r1, r2 = start_row + row_count + 1, start_row
+        if col_count >= 0: c1, c2 = start_col, start_col + col_count - 1
+        else:              c1, c2 = start_col + col_count + 1, start_col
         exclude_set = set()
         for ex in exclude:
             if isinstance(ex,str):
                 m = re.match(r'^([A-Z]+)(\d+)$', ex)
                 if m: exclude_set.add(f"{m.group(1)}{m.group(2)}")
-            elif isinstance(ex,list) and len(ex)==2: exclude_set.add(cell_address(start_col+ex[1], start_row+ex[0]))
+            elif isinstance(ex,list) and len(ex)==2:
+                er=r1+ex[0] if ex[0]>=0 else r2+ex[0]+1
+                ec=c1+ex[1] if ex[1]>=0 else c2+ex[1]+1
+                if er>=1 and ec>=1: exclude_set.add(cell_address(ec,er))
         addresses=[]; values=[]
-        for r in range(start_row, start_row+row_count):
-            if r > (ws.max_row or 1): break
-            for c in range(start_col, start_col+col_count):
-                if c > (ws.max_column or 1): break
+        for r in range(r1, r2+1):
+            if r < 1 or r > (ws.max_row or 1): continue
+            for c in range(c1, c2+1):
+                if c < 1 or c > (ws.max_column or 1): continue
                 addr = cell_address(c,r)
                 if addr in exclude_set: continue
                 cell = ws.cell(r,c); addresses.append(addr); values.append(cell.value)
-        return {'address':addresses[0] if addresses else None,'addresses':addresses,'values':values,'range_count':len(addresses),'start':(start_row,start_col)}
+        return {'address':addresses[0] if addresses else None,'addresses':addresses,'values':values,'range_count':len(addresses),'start':(r1,c1),'r1':r1,'r2':r2,'c1':c1,'c2':c2}
     def _locate_range(self, ws, rule):
         return self._range_cfg(ws, rule.get('anchor',{}), rule.get('target',{}))
 
@@ -1216,10 +1207,10 @@ class OpenpyxlComparer:
                 shift_offset = ds.get('shift_offset', 0)
                 pairs = []
                 old_data_cols = []
-                for c in range(o_start[1], o_start[1] + hcc):
+                for c in range(o_loc.get('c1',o_start[1]), o_loc.get('c2',o_start[1]+hcc-1)+1):
                     has_data = False
-                    for dr in range(hrc):
-                        v = old_wb[sheet].cell(o_start[0] + dr, c).value
+                    for dr in range(o_loc.get('r1',o_start[0]), o_loc.get('r2',o_start[0]+hrc-1)+1):
+                        v = old_wb[sheet].cell(dr, c).value
                         if v is not None and str(v).strip() != '':
                             has_data = True; break
                     if has_data:
@@ -1231,7 +1222,7 @@ class OpenpyxlComparer:
                     self._buf_log(f"规则[{rule.rule_name}] 旧报告标题区域无数据列，跳过该规则"); self._flush_log(force=True); continue
                 plog = '; '.join(f"{get_column_letter(oc)}→{get_column_letter(nc)}" for oc, nc in pairs)
                 self._buf_log(f"规则[{rule.rule_name}] 固定偏移={shift_offset}，配对 {len(pairs)} 列: {plog}")
-                no_data_cols = [c for c in range(o_start[1], o_start[1] + hcc) if c not in set(old_data_cols)]
+                no_data_cols = [c for c in range(o_loc.get('c1',o_start[1]), o_loc.get('c2',o_start[1]+hcc-1)+1) if c not in set(old_data_cols)]
                 if no_data_cols:
                     self._buf_log(f"  旧报告标题区空列(跳过): {','.join(get_column_letter(c) for c in no_data_cols)}")
                 self._flush_log(force=True)
@@ -1244,8 +1235,9 @@ class OpenpyxlComparer:
                         shift_new_map.setdefault((sheet,na),[]).append(entry)
                     # v3.28 标题行自身（机台名/表头等 hrc 覆盖行，新旧按行序对应）也挂配对键：
                     # 列搬移后标题格走配对复核，避免同地址把两台不同机台对撞误报
-                    for dr in range(hrc):
-                        oa=cell_address(oc,o_start[0]+dr); na=cell_address(nc,n_start[0]+dr)
+                    for dr in range(o_loc.get('r1',o_start[0]), o_loc.get('r2',o_start[0]+hrc-1)+1):
+                        ndr = dr - o_loc.get('r1',o_start[0]) + n_loc.get('r1',n_start[0])
+                        oa=cell_address(oc,dr); na=cell_address(nc,ndr)
                         entry=(rule,sheet,oa,sheet,na)
                         shift_old_map.setdefault((sheet,oa),[]).append(entry)
                         shift_new_map.setdefault((sheet,na),[]).append(entry)
@@ -2464,7 +2456,7 @@ class RuleEditorDialog(tb.Toplevel):
         except Exception: pass
         tb.Label(ds,text="锚点文字:").pack(anchor='w'); self.anchor_text_var=tk.StringVar(); self.anchor_entry=tb.Entry(ds,textvariable=self.anchor_text_var,width=40); self.anchor_entry.pack(fill='x',pady=2)
         tb.Label(ds,text="搜索范围(例A1:B2，留空=全表):").pack(anchor='w'); self.search_in_var=tk.StringVar(value=''); self.search_in_cb=tb.Entry(ds,textvariable=self.search_in_var,width=38); self.search_in_cb.pack(fill='x',pady=2)
-        tb.Label(ds,text="模式:").pack(anchor='w'); self.mode_var=tk.StringVar(value='offset'); self.mode_cb=tb.Combobox(ds,textvariable=self.mode_var,values=['offset','collect','intersection','range','shift'],width=38); self.mode_cb.pack(fill='x',pady=2); self.mode_cb.bind('<<ComboboxSelected>>',lambda e:self._build_param_fields())
+        tb.Label(ds,text="模式:").pack(anchor='w'); self.mode_var=tk.StringVar(value='offset'); self.mode_cb=tb.Combobox(ds,textvariable=self.mode_var,values=['offset','intersection','range','shift'],width=38); self.mode_cb.pack(fill='x',pady=2); self.mode_cb.bind('<<ComboboxSelected>>',lambda e:self._build_param_fields())
         self.param_frame=tb.Frame(ds); self.param_frame.pack(fill='x',pady=2); self._build_param_fields()
         right=tb.Frame(main); right.pack(side='right',fill='both',expand=True)
         cf=tb.Labelframe(right,text="检查项（可多选）",padding=10); cf.pack(fill='both',expand=True)
@@ -2491,8 +2483,6 @@ class RuleEditorDialog(tb.Toplevel):
         mode=self.mode_var.get()
         if mode=='offset':
             tb.Label(self.param_frame,text="行偏移(负数向上):").pack(anchor='w'); self.offset_row_var=tk.StringVar(value='0'); tb.Entry(self.param_frame,textvariable=self.offset_row_var,width=10).pack(fill='x',pady=2); tb.Label(self.param_frame,text="列偏移(负数向左):").pack(anchor='w'); self.offset_col_var=tk.StringVar(value='0'); tb.Entry(self.param_frame,textvariable=self.offset_col_var,width=10).pack(fill='x',pady=2)
-        elif mode=='collect':
-            tb.Label(self.param_frame,text="方向:").pack(anchor='w'); self.collect_dir_var=tk.StringVar(value='down'); tb.Combobox(self.param_frame,textvariable=self.collect_dir_var,values=['down','right'],width=10).pack(fill='x',pady=2); tb.Label(self.param_frame,text="起始偏移:").pack(anchor='w'); self.collect_start_var=tk.StringVar(value='1'); tb.Entry(self.param_frame,textvariable=self.collect_start_var,width=10).pack(fill='x',pady=2); tb.Label(self.param_frame,text="最大数量:").pack(anchor='w'); self.collect_max_var=tk.StringVar(value='100'); tb.Entry(self.param_frame,textvariable=self.collect_max_var,width=10).pack(fill='x',pady=2)
         elif mode=='intersection':
             tb.Label(self.param_frame,text="行锚点文字:").pack(anchor='w'); self.row_anchor_text_var=tk.StringVar(); tb.Entry(self.param_frame,textvariable=self.row_anchor_text_var,width=20).pack(fill='x',pady=2); tb.Label(self.param_frame,text="列锚点文字:").pack(anchor='w'); self.col_anchor_text_var=tk.StringVar(); tb.Entry(self.param_frame,textvariable=self.col_anchor_text_var,width=20).pack(fill='x',pady=2)
         elif mode=='range':
@@ -2509,7 +2499,6 @@ class RuleEditorDialog(tb.Toplevel):
         self.rule_name_var.set(self.rule.rule_name); ds=self.rule.data_source; self.sheet_var.set(ds.get('sheet','')); self.anchor_text_var.set(ds.get('anchor',{}).get('text','')); self.search_in_var.set('' if ds.get('search_in','all') in ('all','') else ds.get('search_in','')); self.mode_var.set(ds.get('mode','offset')); self._build_param_fields()
         target=ds.get('target',{}); mode=self.mode_var.get()
         if mode=='offset': self.offset_row_var.set(str(target.get('row_offset',0))); self.offset_col_var.set(str(target.get('col_offset',0)))
-        elif mode=='collect': self.collect_dir_var.set(target.get('direction','down')); self.collect_start_var.set(str(target.get('start_offset',1))); self.collect_max_var.set(str(target.get('max_count',100)))
         elif mode=='range':
             self.range_row_offset_var.set(str(target.get('row_offset',0))); self.range_col_offset_var.set(str(target.get('col_offset',0))); self.range_row_count_var.set(str(target.get('row_count',1))); self.range_col_count_var.set(str(target.get('col_count',1)))
             ex=target.get('exclude',[]); self.range_exclude_var.set(','.join(str(x) if isinstance(x,str) else f"[{x[0]},{x[1]}]" for x in ex))
@@ -2535,9 +2524,8 @@ class RuleEditorDialog(tb.Toplevel):
         except Exception: ds_si='all'
         self.rule.rule_name=self.rule_name_var.get(); ds={'name':self.rule_name_var.get(),'sheet':self.sheet_var.get(),'anchor':{'text':self.anchor_text_var.get()},'search_in':ds_si,'mode':self.mode_var.get()}
         if self.mode_var.get()=='offset': ds['target']={'row_offset':self._to_int(self.offset_row_var),'col_offset':self._to_int(self.offset_col_var)}
-        elif self.mode_var.get()=='collect': ds['target']={'direction':self.collect_dir_var.get(),'start_offset':self._to_int(self.collect_start_var,1),'max_count':self._to_int(self.collect_max_var,100)}
         elif self.mode_var.get()=='intersection': ds['row_anchor']={'text':self.row_anchor_text_var.get().strip(),'search_in':ds_si}; ds['col_anchor']={'text':self.col_anchor_text_var.get().strip(),'search_in':ds_si}
-        elif self.mode_var.get()=='range': ds['target']={'row_offset':self._to_int(self.range_row_offset_var),'col_offset':self._to_int(self.range_col_offset_var),'row_count':max(1,self._to_int(self.range_row_count_var,1)),'col_count':max(1,self._to_int(self.range_col_count_var,1)),'exclude':self._parse_exclude(self.range_exclude_var.get())}
+        elif self.mode_var.get()=='range': ds['target']={'row_offset':self._to_int(self.range_row_offset_var),'col_offset':self._to_int(self.range_col_offset_var),'row_count':self._to_int(self.range_row_count_var,1) or 1,'col_count':self._to_int(self.range_col_count_var,1) or 1,'exclude':self._parse_exclude(self.range_exclude_var.get())}
         elif self.mode_var.get()=='shift':
             ds['header_target']={'row_offset':self._to_int(self.sh_ro_var),'col_offset':self._to_int(self.sh_co_var),'row_count':max(1,self._to_int(self.sh_rc_var,1)),'col_count':max(1,self._to_int(self.sh_cc_var,20))}; ds['rows']=self.sh_rows_var.get().strip(); ds['shift_offset']=self._to_int(self.sh_offset_var)
         self.rule.data_source=ds; self.rule.checks=[]
@@ -2583,8 +2571,8 @@ class DiffViewer:
         tree_frame=tb.Frame(root,padding=(5,0)); tree_frame.pack(fill='both',expand=True); tree_frame.columnconfigure(0,weight=1); tree_frame.rowconfigure(0,weight=1)
         self.tree=tb.Treeview(tree_frame,columns=('action','address','type'),show='tree headings',bootstyle=PRIMARY)
         self.tree.heading('#0',text='Sheet / 差异项'); self.tree.heading('action',text='收起',command=self._toggle_all_nodes); self.tree.heading('address',text='位置'); self.tree.heading('type',text='类型')
-        self.tree.column('#0',width=340,minwidth=200); self.tree.column('action',width=60,minwidth=60,anchor='center',stretch=False); self.tree.column('address',width=90,minwidth=0,anchor='center',stretch=False); self.tree.column('type',width=90,minwidth=0,anchor='center',stretch=False)
-        self.tree.tag_configure('sheet',foreground='blue'); self.tree.tag_configure('warning_sheet',foreground='red'); self.tree.tag_configure('com_fail',foreground='red')
+        self.tree.column('#0',width=340,minwidth=200); self.tree.column('action',width=60,minwidth=60,anchor='center',stretch=False); self.tree.column('address',width=130,minwidth=0,anchor='center',stretch=False); self.tree.column('type',width=130,minwidth=0,anchor='center',stretch=False)
+        self.tree.tag_configure('sheet',foreground='blue'); self.tree.tag_configure('warning_sheet',foreground='red'); self.tree.tag_configure('com_fail',foreground='red'); self.tree.tag_configure('twisty',foreground='#0d6efd')
         try:
             self.root.option_add('*TScrollbar.width',22)
             _st=ttk.Style(); _st.configure('Vertical.TScrollbar',width=22)
@@ -2905,13 +2893,20 @@ class DiffViewer:
         if not self.check_project: self.settings_btn.configure(state='normal')
         if self.stop_event.is_set(): self.log("检查已停止")
         self.progress['value']=100
+    def _set_twisty(self,iid,is_open):
+        vals=list(self.tree.item(iid,'values') or ('','',''))
+        while len(vals)<3: vals.append('')
+        vals[0]='[-]' if is_open else '[+]'
+        self.tree.item(iid,values=vals)
     def _toggle_all_nodes(self):
         kids=self.tree.get_children('')
         if any(self.tree.item(k,'open') for k in kids):
-            for k in kids: self.tree.item(k,open=False)
+            for k in kids:
+                self.tree.item(k,open=False); self._set_twisty(k,False)
             self.tree.heading('action',text='展开')
         else:
-            for k in kids: self.tree.item(k,open=True)
+            for k in kids:
+                self.tree.item(k,open=True); self._set_twisty(k,True)
             self.tree.heading('action',text='收起')
     def populate_tree(self):
         self._pt_err=None
@@ -2939,41 +2934,41 @@ class DiffViewer:
             elif d.get('rule_pass'): rule_pass.append(d)
             else: normal.append(d)
         if sheet_diffs:
-            sn=self.tree.insert('','end',text=f'📋 Sheet 结构差异（{len(sheet_diffs)}）',open=True,tags=('sheet',))
-            for sd in sheet_diffs: node=self.tree.insert(sn,'end',text=sd['desc'],values=('[−]',sd['name'],sd['type'])); self.diff_items.append((node,{'type':'sheet_struct','data':sd}))
+            sn=self.tree.insert('','end',text=f'📋 Sheet 结构差异（{len(sheet_diffs)}）',open=True,values=('[-]','',''),tags=('sheet','twisty'))
+            for sd in sheet_diffs: node=self.tree.insert(sn,'end',text=sd['desc'],values=('[-]',sd['name'],sd['type'])); self.diff_items.append((node,{'type':'sheet_struct','data':sd}))
         if plugin:
-            pn=self.tree.insert('','end',text=f'🔍 数据检查结果（{len(plugin)}）',open=True,tags=('sheet',))
-            for d in plugin: node=self.tree.insert(pn,'end',text=d['desc'][:80],values=('[−]',d['address'],d['type'])); self.diff_items.append((node,{'type':'cell','data':d}))
+            pn=self.tree.insert('','end',text=f'🔍 数据检查结果（{len(plugin)}）',open=True,values=('[-]','',''),tags=('sheet','twisty'))
+            for d in plugin: node=self.tree.insert(pn,'end',text=d['desc'][:80],values=('[-]',d['address'],d['type'])); self.diff_items.append((node,{'type':'cell','data':d}))
         if normal:
-            pn=self.tree.insert('','end',text=f'⚠️ 需人工复核（未豁免）（{len(normal)}）',open=True,tags=('warning_sheet',)); dmap={}
+            pn=self.tree.insert('','end',text=f'⚠️ 需人工复核（未豁免）（{len(normal)}）',open=True,values=('[-]','',''),tags=('warning_sheet',)); dmap={}
             for d in normal: dmap.setdefault(d['sheet'],[]).append(d)
             for sname in self.old_sheet_order:
                 if sname in dmap:
                     merged=self._merge_cell_ranges(dmap[sname]); n_disp=sum(d.get("_merged_count",1) for d in merged)
-                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,tags=('sheet',))
+                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,values=('[-]','',''),tags=('sheet','twisty'))
                     for d in merged:
                         tag=d.get('rule_name') and not d.get('rule_pass')
-                        node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:120],values=('[−]',d['address'],d['type']),tags=(('com_fail',) if d.get('com_confirmed') else (('rule_fail',) if tag else ()))); self.diff_items.append((node,{'type':'cell','data':d}))
+                        node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:120],values=('[-]',d['address'],d['type']),tags=(('com_fail',) if d.get('com_confirmed') else (('rule_fail',) if tag else ()))); self.diff_items.append((node,{'type':'cell','data':d}))
             for sname in dmap:
                 if sname not in self.old_sheet_order:
                     merged=self._merge_cell_ranges(dmap[sname]); n_disp=sum(d.get("_merged_count",1) for d in merged)
-                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,tags=('sheet',))
+                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,values=('[-]','',''),tags=('sheet','twisty'))
                     for d in merged:
                         tag=d.get('rule_name') and not d.get('rule_pass')
-                        node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:120],values=('[−]',d['address'],d['type']),tags=(('com_fail',) if d.get('com_confirmed') else (('rule_fail',) if tag else ()))); self.diff_items.append((node,{'type':'cell','data':d}))
+                        node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:120],values=('[-]',d['address'],d['type']),tags=(('com_fail',) if d.get('com_confirmed') else (('rule_fail',) if tag else ()))); self.diff_items.append((node,{'type':'cell','data':d}))
         if rule_pass:
-            pn=self.tree.insert('','end',text=f'✅ 已豁免（可展开）（{len(rule_pass)}）',open=False,tags=('sheet',)); dmap={}
+            pn=self.tree.insert('','end',text=f'✅ 已豁免（可展开）（{len(rule_pass)}）',open=False,values=('[+]','',''),tags=('sheet','twisty')); dmap={}
             for d in rule_pass: dmap.setdefault(d['sheet'],[]).append(d)
             for sname in self.old_sheet_order:
                 if sname in dmap:
                     merged=self._merge_cell_ranges(dmap[sname]); n_disp=sum(d.get('_merged_count',1) for d in merged)
-                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,tags=('sheet',))
-                    for d in merged: node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:100],values=('[−]',d['address'],d['type'])); self.diff_items.append((node,{'type':'cell','data':d}))
+                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,values=('[-]','',''),tags=('sheet','twisty'))
+                    for d in merged: node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:100],values=('[-]',d['address'],d['type'])); self.diff_items.append((node,{'type':'cell','data':d}))
             for sname in dmap:
                 if sname not in self.old_sheet_order:
                     merged=self._merge_cell_ranges(dmap[sname]); n_disp=sum(d.get('_merged_count',1) for d in merged)
-                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,tags=('sheet',))
-                    for d in merged: node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:100],values=('[−]',d['address'],d['type'])); self.diff_items.append((node,{'type':'cell','data':d}))
+                    sn=self.tree.insert(pn,'end',text=f"📄 {sname}（{n_disp}）",open=True,values=('[-]','',''),tags=('sheet','twisty'))
+                    for d in merged: node=self.tree.insert(sn,'end',text=(d.get('short_desc') or d['desc'])[:100],values=('[-]',d['address'],d['type'])); self.diff_items.append((node,{'type':'cell','data':d}))
 
         self.log(f"检查完成：需人工复核 {len(normal)} 项，已豁免 {len(rule_pass)} 项，插件 {len(plugin)} 项")
     @staticmethod
@@ -3036,9 +3031,15 @@ class DiffViewer:
         if self.tree.identify_column(event.x)!='#1': return
         iid=self.tree.identify_row(event.y)
         if not iid: return
-        parent=self.tree.parent(iid)
-        if parent: self.tree.item(parent,open=False); self.tree.see(parent)
-        else: self.tree.item(iid,open=False); self.tree.see(iid)
+        if self.tree.get_children(iid):
+            # 父级行：[-]/[+] 单击切换展开/收起
+            is_open=not self.tree.item(iid,'open')
+            self.tree.item(iid,open=is_open); self._set_twisty(iid,is_open); self.tree.see(iid)
+        else:
+            # 叶子行：保持原行为（收起所属父级），同步父级标记为 [+]
+            parent=self.tree.parent(iid)
+            if parent:
+                self.tree.item(parent,open=False); self._set_twisty(parent,False); self.tree.see(parent)
     def jump_to_excel(self,file_path,sheet_name,cell_addr):
         # 返回 'opened'(已跳转)/False；不再静默启动 Excel（由上层询问后 os.startfile 打开）
         try:
