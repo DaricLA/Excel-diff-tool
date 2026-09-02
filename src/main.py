@@ -6,11 +6,12 @@ import threading, time, os, sys, json, zipfile, re, copy, colorsys, random
 import pythoncom, win32com.client
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.worksheet.cell_range import MultiCellRange
 from lxml import etree
 
 NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 PROGRAM_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
-VERSION = "v3.54"
+VERSION = "v3.67"
 
 DEFAULT_CHECK_OPTIONS = {
     'value': True, 'formula': True, 'rich_text': True, 'font': True,
@@ -51,6 +52,24 @@ BUILTIN_NUMFMTS = {
     39:'#,##0.00;(#,##0.00)',40:'#,##0.00;[Red](#,##0.00)',
     45:'mm:ss',46:'[h]:mm:ss',47:'mmss.0',48:'##0.0E+0',49:'@',
 }
+# 常见数字格式 -> 可读描述（覆盖 Excel 下拉菜单常见格式）
+_NUMFMT_READABLE = {
+    'general': '常规', '@': '文本',
+    '0': '整数', '0.00': '数字(2位小数)',
+    '#,##0': '千分位整数', '#,##0.00': '千分位2位小数',
+    '0%': '百分比', '0.00%': '百分比2位小数',
+    '¥#,##0': '人民币整数', '¥#,##0.00': '人民币2位小数',
+    '$#,##0': '美元整数', '$#,##0.00': '美元2位小数',
+    'yyyy-mm-dd': '日期(年-月-日)', 'yyyy/m/d': '日期(年/月/日)',
+    'm/d/yyyy': '日期(月/日/年)', 'd/m/yyyy': '日期(日/月/年)',
+    'h:mm': '时间(时:分)', 'h:mm:ss': '时间(时:分:秒)',
+}
+
+def format_numfmt_readable(fmt):
+    """数字格式码 -> 可读描述（常见格式转中文，自定义格式去掉语言前缀后如实显示）；模块级，供两类比对共用"""
+    if not fmt: return '常规'
+    s = re.sub(r'\[\$-[^\]]*\]', '', str(fmt)).strip()  # 去掉 [$-441] 等语言前缀
+    return _NUMFMT_READABLE.get(s.lower(), s)  # 常见格式转中文；自定义格式去前缀后如实显示
 
 def excel_tint(hex6, tint):
     """ECMA-376 主题色 tint 变换：RGB->HLS(浮点)->亮度调整->RGB。
@@ -174,6 +193,7 @@ class WorkbookStyleCache:
         self.indexed = {i: v for i, v in enumerate(DEFAULT_INDEXED)}
         self.indexed[64] = '000000'; self.indexed[65] = 'FFFFFF'
         self.theme = {}
+        self.font_equiv = []  # 字体等价组列表
         self.num_fmts = {}
         self.cell_xfs = []      # [{numFmtId, fontId, fillId, borderId, xfId, applyNF}]
         self.style_xfs = []     # cellStyleXfs（命名样式基类）
@@ -287,6 +307,41 @@ class WorkbookStyleCache:
         except Exception:
             pass
 
+        # 解析字体等价表
+        try:
+            root = etree.fromstring(self._zip.read('xl/theme/theme1.xml'))
+            for fg_tag in ('majorFont', 'minorFont'):
+                fg = root.find('.//%s%s' % (self.NSA, fg_tag))
+                if fg is None: continue
+                names = set()
+                latin = fg.find('%slatin' % self.NSA)
+                if latin is not None:
+                    tf = latin.get('typeface', '')
+                    if tf: names.add(tf)
+                for fs in fg.findall('%sfont' % self.NSA):
+                    tf = fs.get('typeface', '')
+                    if tf: names.add(tf)
+                ea = fg.find('%sea' % self.NSA)
+                if ea is not None:
+                    tf = ea.get('typeface', '')
+                    if not tf:
+                        hans = fg.find('%sfont[@script="Hans"]' % self.NSA)
+                        if hans is not None and hans.get('typeface'):
+                            names.add(hans.get('typeface'))
+                    else:
+                        names.add(tf)
+                if len(names) > 1:
+                    self.font_equiv.append(names)
+        except Exception:
+            pass
+
+    def _font_names_equivalent(self, n1, n2):
+        if not n1 or not n2: return False
+        if n1 == n2: return True
+        for group in self.font_equiv:
+            if n1 in group and n2 in group:
+                return True
+        return False
     # ---------- styles.xml ----------
     def _color_elem_to_dict(self, ce):
         if ce is None: return None
@@ -1139,7 +1194,7 @@ class OpenpyxlComparer:
                 self.diffs.append({'sheet':'🔍 数据检查','address':diff.get('rule_name',''),'type':diff['type'],'desc':diff['desc']})
         if self.check_project: self.progress(90,"执行进阶规则过滤..."); self._apply_rule_filter(self.diffs,old_wb,new_wb)
     def _apply_rule_filter(self, diffs, old_wb, new_wb):
-        diff_type_map={'内容变化':'value','公式变化':'formula','字体变化':'font','填充变化':'fill','边框变化':'border','对齐变化':'alignment','数字格式变化':'number_format','合并新增':'merged_cells','合并删除':'merged_cells','行高变化':'row_height','列宽变化':'col_width','图片新增':'images','图片变动':'images','图片尺寸变化':'images','条件格式新增':'conditional_format','条件格式删除':'conditional_format','条件格式修改':'conditional_format','富文本变化':'rich_text','单元格新增':'value','单元格删除':'value'}
+        diff_type_map={'内容变化':'value','公式变化':'formula','字体变化':'font','填充变化':'fill','边框变化':'border','对齐变化':'alignment','数字格式变化':'number_format','合并新增':'merged_cells','合并删除':'merged_cells','行高变化':'row_height','列宽变化':'col_width','图片新增':'images','图片变动':'images','图片尺寸变化':'images','条件格式新增':'conditional_format','条件格式删除':'conditional_format','条件格式修改':'conditional_format','条件格式变化':'conditional_format','富文本变化':'rich_text','单元格新增':'value','单元格删除':'value'}
         rule_addr_map={}; shift_new_map={}; shift_old_map={}; locator=DataLocator()
         for rule in self.check_project.rules:
             ds=rule.data_source
@@ -1224,10 +1279,12 @@ class OpenpyxlComparer:
                     nc=column_index_from_string(''.join(ch for ch in n_addr if ch.isalpha())); nrow=int(''.join(ch for ch in n_addr if ch.isdigit()))
                     old_cell=old_ws.cell(row=orow,column=oc); new_cell=new_ws.cell(row=nrow,column=nc)
                     diff=self._compare_by_check_type(check_type,old_cell,new_cell,check.options,old_ws,new_ws,o_addr,o_sheet,new_address=n_addr,new_sheet_name=n_sheet)
-                    if (check.expect=='same' and diff is None) or (check.expect=='different'):
-                        d['rule_pass']=True; d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; matched=True; break
+                    # same 期望：shift 配对比较一致才豁免；different 期望：配对比较 round 后确实有差异才豁免
+                    # （公式浮点尾差经新端数值精度 round 后不判差异；round 后一致=实质未变，不满足"期望不同"，不豁免）
+                    if (check.expect=='same' and diff is None) or (check.expect=='different' and diff is not None):
+                        d['rule_pass']=True; d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=diff or '一致'; matched=True; break
                     else:
-                        d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; matched=True; break
+                        d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=diff; matched=True; break
                 if matched: break
             if matched: continue
             for rule in hits:
@@ -1239,9 +1296,10 @@ class OpenpyxlComparer:
                     col=column_index_from_string(col_str); row=int(row_str)
                     old_cell=old_ws.cell(row=row,column=col); new_cell=new_ws.cell(row=row,column=col)
                     diff=self._compare_by_check_type(check_type,old_cell,new_cell,check.options,old_ws,new_ws,d['address'],d['sheet'])
-                    if (check.expect=='same' and diff is None) or (check.expect=='different'):
-                        d['rule_pass']=True; d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; break
-                    else: d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; break
+                    # 同地址规则：same 期望比较一致才豁免；different 期望 round 后确实有差异才豁免
+                    if (check.expect=='same' and diff is None) or (check.expect=='different' and diff is not None):
+                        d['rule_pass']=True; d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=diff or '一致'; break
+                    else: d['rule_name']=rule.rule_name; d['rule_expect']=check.expect; d['rule_diff_desc']=diff; break
                 if d.get('rule_pass'): break
     @staticmethod
     def _parse_row_spec(spec):
@@ -1260,6 +1318,9 @@ class OpenpyxlComparer:
     def _normalize_number_format(self, fmt):
         if fmt is None: return ''
         s=re.sub(r'\s','',fmt); s=re.sub(r'\\(.)',r'\1',s); return s.lower()
+    def _format_numfmt_readable(self, fmt):
+        """数字格式码 -> 可读描述（委托模块级函数）"""
+        return format_numfmt_readable(fmt)
     def _get_actual_number_format(self, cell, which):
         cache = self.old_cache if which == 'old' else self.new_cache
         if cache is None:
@@ -1275,30 +1336,41 @@ class OpenpyxlComparer:
         if re.search(r'[ymdhs]',base,re.I): return -1          # 日期时间，不放宽
         m=re.findall(r'\d',seg.split('.')[1].split(';')[0]) if '.' in seg else []
         if '%' in seg:
-            return (len(m) if m else 0) + 2                     # 百分比：小数位数+2（%=×100）
+            return -1                                             # 百分比：不做 round 豁免，直接用存储值对比
         if m: return len(m)                                     # 0.0000 -> 4位
         return 0                                                # 整数显示（#,##0 等）
+    @staticmethod
+    def _value_decimals(v):
+        # 数值本身的小数位数（以待测端粘贴值的精度定义 round 位数）
+        if isinstance(v,bool) or not isinstance(v,(int,float)): return None
+        f=v if isinstance(v,float) else float(v)
+        s=repr(f)
+        if 'e' in s or 'E' in s:
+            m,e=s.split('e') if 'e' in s else s.split('E')
+            exp=int(e)
+            d=len(m.split('.')[1]) if '.' in m else 0
+            return max(0,d-exp)
+        if '.' in s:
+            frac=s.split('.')[1]
+            return 0 if frac.strip('0')=='' else len(frac)
+        return 0
     def _display_equivalent(self,old_cell,new_cell,old_sheet,new_sheet,old_val=None,new_val=None):
-        # 两格值严格不等时，按 Excel 显示精度判定是否实质一致（跨版本保存的 ulp 浮点尾差豁免）
+        # 两格值严格不等时的浮点尾差豁免：
+        # shift 场景旧端常为公式（缓存值带完整浮点尾数），新端是粘贴值（精度以新端数值为准）。
+        # 规则：按【待测端（新格）数值本身的小数位数】N 把双方 round N 位再比；
+        #       N 由新值数值位数定义，不依赖数字格式（百分比/公式格格式不再挡豁免）；
+        #       新格为日期/时间显示格式时不放宽（避免日期序列数误豁免）。
         v1=old_val if old_val is not None else old_cell.value
         v2=new_val if new_val is not None else new_cell.value
+        if isinstance(v1,bool) or isinstance(v2,bool): return False
         if not (isinstance(v1,(int,float)) and isinstance(v2,(int,float))): return False
         try:
-            f1=self._get_actual_number_format(old_cell,'old'); f2=self._get_actual_number_format(new_cell,'new')
-            d1=self._fmt_decimals(f1); d2=self._fmt_decimals(f2)
-            if d1<0 and d2<0: return False                      # 两边都是日期/非数值：不放宽
-            if (d1<0)!=(d2<0): return False                      # 一边日期一边数值：不等
-            # 以待检报告（新格）的格式精度为基准 round 后比较
-            # 旧格可能是公式（无限精度），新格是粘贴值的最终精度定义
-            if d2>=0:
-                d_use=d2  # 新格有显式格式，以新格精度为准
-            elif d1>=0:
-                d_use=d1  # 新格 General，旧格有显式格式，用旧格精度
-            else:
-                d_use=-1  # 两边都 General
-            if d_use>=0:
-                if format(v1,f'.{d_use}f')==format(v2,f'.{d_use}f'): return True
-            # 兜底：相对容差 1e-9
+            f2=self._get_actual_number_format(new_cell,'new')
+            if self._fmt_decimals(f2)<0 and re.search(r'[ymdhs]',str(f2 or '').split(';')[0].split(']')[-1],re.I):
+                return False                                    # 新格按日期/时间显示：不放宽
+            n=self._value_decimals(v2)
+            if n is not None and round(v1,n)==round(v2,n): return True
+            # 兜底：相对容差 1e-9（round 未覆盖的极端 ulp 尾差）
             return abs(v1-v2)<=1e-9*max(abs(v1),abs(v2),1.0)
         except Exception: return False
     @staticmethod
@@ -1388,7 +1460,7 @@ class OpenpyxlComparer:
                     nf1=self._get_actual_number_format(old_cell,'old')
                     nf2=self._get_actual_number_format(new_cell,'new')
                     if self._normalize_number_format(nf1)!=self._normalize_number_format(nf2):
-                        self.diffs.append({'sheet':sheet_name,'address':addr,'type':'数字格式变化','desc':f'{nf1} → {nf2}'})
+                        self.diffs.append({'sheet':sheet_name,'address':addr,'type':'数字格式变化','desc':f'数字格式: {self._format_numfmt_readable(nf1)} → {self._format_numfmt_readable(nf2)}'})
                 row_count+=1
                 if row_count%batch_size==0:
                     self.progress(25+int(55*(row_idx/max_row)),f" {sheet_name}: {row_idx}/{max_row}行..."); self._flush_log(force=True)
@@ -1413,7 +1485,11 @@ class OpenpyxlComparer:
         n1=value_to_str(v1); n2=value_to_str(v2)
         if bool(f1)!=bool(f2): return f"公式状态: {'是' if f1 else '否'} → {'是' if f2 else '否'}"
         if f1 and f2 and normalize_formula(f1)!=normalize_formula(f2): return f"公式: {f1} → {f2}"
-        if n1!=n2: return f"{n1[:120]} → {n2[:120]}"
+        if n1!=n2:
+            # 数值尾差豁免：两边都是纯数值（非公式）时，按新端数值小数位 round 后一致则不报
+            if not f1 and not f2 and isinstance(v1,(int,float)) and not isinstance(v1,bool) and isinstance(v2,(int,float)) and not isinstance(v2,bool):
+                if self._display_equivalent(c1,c2,'','',v1,v2): return None
+            return f"{n1[:120]} → {n2[:120]}"
         return None
     def _cmp_font(self, old_cell, new_cell):
         changes=[]
@@ -1421,7 +1497,9 @@ class OpenpyxlComparer:
         f2 = self.new_cache.resolve_font(new_cell, new_cell.font) if self.new_cache else None
         if f1 is None or f2 is None: return None
         n1=f1.get('name'); n2=f2.get('name')
-        if n1 and n2 and n1!=n2: changes.append(f"字体: {n1}→{n2}")
+        if n1 and n2 and n1!=n2:
+            if not self.old_cache._font_names_equivalent(n1, n2):
+                changes.append(f"字体: {n1}→{n2}")
         s1=f1.get('size') or 11; s2=f2.get('size') or 11
         if s1!=s2: changes.append(f"字号: {s1}→{s2}")
         b1=bool(f1.get('bold')); b2=bool(f2.get('bold'))
@@ -1553,15 +1631,38 @@ class OpenpyxlComparer:
     def _compare_conditional_formats(self,old_ws,new_ws,sheet_name):
         old_cfs=list(old_ws.conditional_formatting); new_cfs=list(new_ws.conditional_formatting)
         old_map={str(cf.sqref):cf for cf in old_cfs}; new_map={str(cf.sqref):cf for cf in new_cfs}
-        for rng in set(old_map)|set(new_map):
-            old_cf=old_map.get(rng); new_cf=new_map.get(rng)
-            if old_cf is None: self.diffs.append({'sheet':sheet_name,'address':rng.split(':')[0],'type':'条件格式新增','desc':f'新增条件格式范围: {rng}'})
-            elif new_cf is None: self.diffs.append({'sheet':sheet_name,'address':rng.split(':')[0],'type':'条件格式删除','desc':f'删除条件格式范围: {rng}'})
+        # 按 address（范围首单元格）分组
+        addr_to_old={}; addr_to_new={}
+        for rng,cf in old_map.items(): addr_to_old.setdefault(rng.split(':')[0],[]).append((rng,cf))
+        for rng,cf in new_map.items(): addr_to_new.setdefault(rng.split(':')[0],[]).append((rng,cf))
+        # 遍历所有地址，输出合并后的结果
+        for addr in sorted(set(addr_to_old)|set(addr_to_new)):
+            old_items=addr_to_old.get(addr,[]); new_items=addr_to_new.get(addr,[])
+            if not old_items and new_items:
+                # 新增：附规则明细
+                for rng,cf in new_items:
+                    details=self._cf_rules_brief(cf.rules)
+                    desc=f"新增规则（范围 {rng}）：{details}"
+                    self.diffs.append({'sheet':sheet_name,'address':addr,'type':'条件格式新增','desc':desc,'short_desc':f"新增规则（{rng}）"})
+            elif old_items and not new_items:
+                # 删除：附规则明细
+                for rng,cf in old_items:
+                    details=self._cf_rules_brief(cf.rules)
+                    desc=f"删除规则（范围 {rng}）：{details}"
+                    self.diffs.append({'sheet':sheet_name,'address':addr,'type':'条件格式删除','desc':desc,'short_desc':f"删除规则（{rng}）"})
             else:
-                od=self._cf_rule_diffs(old_cf.rules,new_cf.rules)
-                if od:
-                    short_desc=f'条件格式规则变化（范围{rng}）'
-                    self.diffs.append({'sheet':sheet_name,'address':rng.split(':')[0],'type':'条件格式修改','desc':f'条件格式规则变化（范围{rng}）：{od}','short_desc':short_desc})
+                # 两者都有，比较规则差异
+                for old_rng,old_cf in old_items:
+                    for new_rng,new_cf in new_items:
+                        od=self._cf_rule_diffs(old_cf.rules,new_cf.rules)
+                        if od:
+                            if old_rng==new_rng:
+                                desc=f"规则变化（范围 {old_rng}）：{od}"
+                                short=f"规则变化（{old_rng}）"
+                            else:
+                                desc=f"规则变化（范围 {old_rng} → {new_rng}）：{od}"
+                                short=f"规则变化（{old_rng} → {new_rng}）"
+                            self.diffs.append({'sheet':sheet_name,'address':addr,'type':'条件格式变化','desc':desc,'short_desc':short})
     # Excel 内置条件格式标准色 -> 中文色名
     _CF_COLOR_NAMES={'FFC7CE':'浅红','9C0006':'深红','C6EFCE':'浅绿','006100':'深绿','FFEB9C':'浅黄','9C6500':'深黄',
                      'FF0000':'红色','00B050':'绿色','FFFF00':'黄色','0070C0':'蓝色','FFFFFF':'白色','000000':'黑色'}
@@ -1615,36 +1716,56 @@ class OpenpyxlComparer:
                 if isinstance(f,(list,tuple)): f=','.join(str(x) for x in f)
                 rt=getattr(r,'type','?') or '?'; op=getattr(r,'operator',None)
                 cond=self._CF_TYPE_MAP.get(rt,rt)
-                if op and op in self._CF_OP_MAP: cond+='（'+self._CF_OP_MAP[op]+'）'
+                # containsText/notContainsText 的 operator 与类型语义重复，不追加后缀
+                if op and op in self._CF_OP_MAP and rt not in ('containsText','notContainsText'):
+                    cond+='（'+self._CF_OP_MAP[op]+'）'
                 dxf_obj=getattr(r,'dxf',None)
                 has_fmt=bool(dxf_obj is not None and (getattr(dxf_obj,'fill',None) is not None or getattr(dxf_obj,'font',None) is not None))
+                flabel = '阈值' if rt=='cellIs' else ('文本' if rt in ('containsText','notContainsText') else '公式')
                 out.append({'cond':cond,
                             'formula':str(f) if f is not None else '',
+                            'flabel':flabel,
                             'dxf':self._cf_dxf_brief(dxf_obj),'has_fmt':has_fmt,
                             'stop':bool(getattr(r,'stopIfTrue',False))})
             except Exception:
-                out.append({'cond':'?','formula':'','dxf':'?','has_fmt':False,'stop':False})
+                out.append({'cond':'?','formula':'','flabel':'公式','dxf':'?','has_fmt':False,'stop':False})
         return out
 
+    def _cf_rule_brief_one(self, s):
+        """单条规则摘要 -> 可读明细：[条件类型] 公式xxx 填充浅红/字色深红/加粗；格式为空时不写"""
+        bits=[]
+        if s.get('formula'): bits.append(f"{s.get('flabel','公式')}{s['formula']}")
+        dxf=s.get('dxf','')
+        if dxf and dxf not in ('无格式','?'): bits.append(dxf)
+        tail=('；'+'；'.join(bits)) if bits else ''
+        stop='，为真则停止' if s.get('stop') else ''
+        return f"[{s.get('cond','?')}]{tail}{stop}"
+
+    def _cf_rules_brief(self, rules):
+        """规则列表 -> 可读明细串（用于新增/删除时展示规则内容）"""
+        summaries=self._cf_rule_summaries(rules)
+        if not summaries: return '无规则'
+        return '；'.join(f"规则{i+1}{self._cf_rule_brief_one(s)}" for i,s in enumerate(summaries))
+
     def _cf_rule_diffs(self, old_rules, new_rules):
-        """逐条比对两侧条件格式规则，返回可读差异文本；无差异返回 ''"""
+        """逐条比对两侧规则，输出变化前→变化后的可读差异；无差异返回 ''"""
         o=self._cf_rule_summaries(old_rules); n=self._cf_rule_summaries(new_rules)
         parts=[]
         for i in range(max(len(o),len(n))):
             ro=o[i] if i<len(o) else None; rn=n[i] if i<len(n) else None
             if ro is None:
-                parts.append(f"新增规则{i+1}[{rn['cond']}] 公式{rn['formula'] or '无'} {rn['dxf']}"+('，为真则停止' if rn['stop'] else '')); continue
+                parts.append(f"新增规则{i+1}{self._cf_rule_brief_one(rn)}"); continue
             if rn is None:
-                parts.append(f"删除规则{i+1}[{ro['cond']}] 公式{ro['formula'] or '无'} {ro['dxf']}"+('，为真则停止' if ro['stop'] else '')); continue
+                parts.append(f"删除规则{i+1}{self._cf_rule_brief_one(ro)}"); continue
             if ro==rn: continue
             sub=[]
-            if ro['cond']!=rn['cond']: sub.append(f"条件{ro['cond']}→{rn['cond']}")
-            if ro['formula']!=rn['formula']: sub.append(f"公式{ro['formula'] or '无'}→{rn['formula'] or '无'}")
+            if ro['cond']!=rn['cond']: sub.append(f"条件：{ro['cond']} → {rn['cond']}")
+            if ro['formula']!=rn['formula']: sub.append(f"{rn.get('flabel','公式')}：{ro['formula'] or '无'} → {rn['formula'] or '无'}")
             # 新版有填充/字体对象但读不出颜色（openpyxl 解析主题色失败）时，跳过格式对比避免误报
             if ro['dxf']!=rn['dxf'] and not (rn['has_fmt'] and rn['dxf'] in ('无格式','?')):
-                sub.append(f"格式{ro['dxf']}→{rn['dxf']}")
-            if ro['stop']!=rn['stop']: sub.append('勾消为真则停止' if ro['stop'] else '勾选为真则停止')
-            parts.append(f"规则{i+1}[{rn['cond']}] "+'，'.join(sub))
+                sub.append(f"格式：{ro['dxf']} → {rn['dxf']}")
+            if ro['stop']!=rn['stop']: sub.append('停止：开 → 关' if ro['stop'] else '停止：关 → 开')
+            parts.append(f"规则{i+1}（{rn['cond']}）：" + '；'.join(sub))
         return '；'.join(parts)
 
     def _compare_by_check_type(self, check_type, old_cell, new_cell, options=None, old_ws=None, new_ws=None, address=None, sheet_name='', new_address=None, new_sheet_name=''):
@@ -1660,16 +1781,18 @@ class OpenpyxlComparer:
             ov = old_cell.value; nv = new_cell.value
             if isinstance(ov, str) and ov.startswith('='):
                 if self.old_wb_values is None:
-                    self._buf_log("首次遇到公式格，加载旧版缓存值副本..."); self._flush_log(force=True)
-                    self.old_wb_values = load_workbook(self.old_path, data_only=True)
+                    def _load_old_vals(): return load_workbook(self.old_path, data_only=True)
+                    self.old_wb_values = self._with_heartbeat("加载旧版缓存值副本", _load_old_vals)
+                    self._buf_log(f"✓ 旧版缓存加载完成"); self._flush_log(force=True)
                 try:
                     ov = self.old_wb_values[sheet_name].cell(old_cell.row, old_cell.column).value
                     if isinstance(ov, str): ov = self._try_number(ov)
                 except Exception: pass
             if isinstance(nv, str) and nv.startswith('='):
                 if self.new_wb_values is None:
-                    self._buf_log("首次遇到公式格，加载新版缓存值副本..."); self._flush_log(force=True)
-                    self.new_wb_values = load_workbook(self.new_path, data_only=True)
+                    def _load_new_vals(): return load_workbook(self.new_path, data_only=True)
+                    self.new_wb_values = self._with_heartbeat("加载新版缓存值副本", _load_new_vals)
+                    self._buf_log(f"✓ 新版缓存加载完成"); self._flush_log(force=True)
                 try:
                     nv = self.new_wb_values[new_sheet_name].cell(new_cell.row, new_cell.column).value
                     if isinstance(nv, str): nv = self._try_number(nv)
@@ -1696,7 +1819,7 @@ class OpenpyxlComparer:
         elif check_type=='number_format':
             nf1=self._get_actual_number_format(old_cell,'old')
             nf2=self._get_actual_number_format(new_cell,'new')
-            if self._normalize_number_format(nf1)!=self._normalize_number_format(nf2): return f"{nf1} → {nf2}"
+            if self._normalize_number_format(nf1)!=self._normalize_number_format(nf2): return f"数字格式: {self._format_numfmt_readable(nf1)} → {self._format_numfmt_readable(nf2)}"
         elif check_type=='merged_cells':
             om=str(old_cell.coordinate) if any(str(old_cell.coordinate) in str(m) for m in old_ws.merged_cells.ranges) else None
             nm=str(new_cell.coordinate) if any(str(new_cell.coordinate) in str(m) for m in new_ws.merged_cells.ranges) else None
@@ -1727,13 +1850,31 @@ class OpenpyxlComparer:
             old_has=any(addr==address for addr,_,_ in old_imgs); new_has=any(addr==new_address for addr,_,_ in new_imgs)
             if old_has!=new_has: return f"图片存在: {old_has} → {new_has}"
         elif check_type=='conditional_format':
-            old_cf=self._get_conditional_format_for_cell(old_ws,address); new_cf=self._get_conditional_format_for_cell(new_ws,new_address)
-            if old_cf!=new_cf: return f"条件格式: {old_cf} → {new_cf}"
+            old_rng,old_rules=self._get_cfs_for_cell(old_ws,address)
+            new_rng,new_rules=self._get_cfs_for_cell(new_ws,new_address)
+            if old_rng!=new_rng:
+                od=self._cf_rule_diffs(old_rules,new_rules)
+                tail=f"，{od}" if od else ''
+                return f"规则范围: {old_rng or '无'} → {new_rng or '无'}{tail}"
+            if old_rng is None: return None
+            od=self._cf_rule_diffs(old_rules,new_rules)
+            if od: return f"规则变化: {od}"
         return None
-    def _get_conditional_format_for_cell(self,ws,address):
+    def _get_cfs_for_cell(self, ws, address):
+        """返回 (范围描述, 该单元格命中的所有规则列表)；未命中返回 (None, [])。
+        用 MultiCellRange 正确处理多区域 sqref（如 A1:B2 D10:E10）。"""
+        ranges=[]; rules=[]
         for cf in ws.conditional_formatting:
-            if address in str(cf.sqref): return str(cf.rules)
-        return None
+            sq=str(cf.sqref)
+            try:
+                hit = address in MultiCellRange(sq)
+            except Exception:
+                hit = address in sq
+            if hit:
+                ranges.append(sq)
+                try: rules.extend(list(cf.rules))
+                except Exception: pass
+        return ('；'.join(ranges) if ranges else None), rules
     def _compare_sheets(self,old_wb,new_wb):
         old_names=set(old_wb.sheetnames); new_names=set(new_wb.sheetnames)
         for name in sorted(new_names-old_names,key=lambda n:list(new_names).index(n)):
@@ -1935,11 +2076,6 @@ class ExcelCOMVerifier:
         try:
             old_ws = self.old_wb.Worksheets(sheet)
             new_ws = self.new_wb.Worksheets(sheet)
-            # 激活工作表以强制 Excel 解析主题字体/颜色等延迟属性，防止 COM 读取到未解析的值
-            try: old_ws.Activate()
-            except Exception: pass
-            try: new_ws.Activate()
-            except Exception: pass
             old_r = old_ws.Range(addr)
             new_r = new_ws.Range(addr)
         except Exception as e:
@@ -1948,95 +2084,155 @@ class ExcelCOMVerifier:
 
         try:
             if dtype == '填充变化':
-                return self._cmp_fill_com(old_r, new_r)
+                diff_desc = self._cmp_fill_com(old_r, new_r)
+                if diff_desc:
+                    diff['com_diff_desc'] = diff_desc
+                    return False
+                return True
             elif dtype == '字体变化':
-                return self._cmp_font_com(old_r, new_r)
+                diff_desc = self._cmp_font_com(old_r, new_r)
+                if diff_desc:
+                    diff['com_diff_desc'] = diff_desc
+                    return False
+                return True
             elif dtype == '边框变化':
-                return self._cmp_border_com(old_r, new_r)
+                diff_desc = self._cmp_border_com(old_r, new_r)
+                if diff_desc:
+                    diff['com_diff_desc'] = diff_desc
+                    return False
+                return True
             elif dtype == '数字格式变化':
-                return self._cmp_numfmt_com(old_r, new_r)
+                diff_desc = self._cmp_numfmt_com(old_r, new_r)
+                if diff_desc:
+                    diff['com_diff_desc'] = diff_desc
+                    return False
+                return True
             elif dtype == '行高变化':
-                return self._cmp_rowheight_com(old_r, new_r)
+                diff_desc = self._cmp_rowheight_com(old_r, new_r)
+                if diff_desc:
+                    diff['com_diff_desc'] = diff_desc
+                    return False
+                return True
             elif dtype == '列宽变化':
-                return self._cmp_colwidth_com(old_r, new_r)
+                diff_desc = self._cmp_colwidth_com(old_r, new_r)
+                if diff_desc:
+                    diff['com_diff_desc'] = diff_desc
+                    return False
+                return True
             elif dtype == '对齐变化':
-                return self._cmp_align_com(old_r, new_r)
+                diff_desc = self._cmp_align_com(old_r, new_r)
+                if diff_desc:
+                    diff['com_diff_desc'] = diff_desc
+                    return False
+                return True
         except Exception as e:
             self.log(f"  高级审核：{sheet}!{addr} {dtype} 读取异常: {e}")
             return False
         return False
 
     def _ole_to_rgb(self, ole_long):
-        v = ole_long & 0xFFFFFF
+        v = int(ole_long) & 0xFFFFFF
         return (v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF)
 
     def _cmp_fill_com(self, old_r, new_r):
+        """返回差异描述或空字符串(一致)"""
+        changes = []
         try:
             oc = self._ole_to_rgb(old_r.Interior.Color)
             nc = self._ole_to_rgb(new_r.Interior.Color)
-            if oc != nc: return False
-        except Exception:
-            return False
-        try:
-            if old_r.Interior.Pattern != new_r.Interior.Pattern: return False
+            if oc != nc:
+                changes.append(f"颜色: RGB:{oc:06X} → RGB:{nc:06X}")
         except Exception:
             pass
-        return True
-
+        try:
+            op = old_r.Interior.Pattern
+            np_ = new_r.Interior.Pattern
+            if op != np_: changes.append(f"图案: {op} → {np_}")
+        except Exception:
+            pass
+        return "; ".join(changes) if changes else ""
     def _cmp_font_com(self, old_r, new_r):
+        """返回差异描述或空字符串(一致)"""
+        changes = []
         try:
             oc = self._ole_to_rgb(old_r.Font.Color)
             nc = self._ole_to_rgb(new_r.Font.Color)
-            if oc != nc: return False
+            if oc != nc:
+                changes.append(f"颜色: RGB:{oc:06X} → RGB:{nc:06X}")
         except Exception:
-            return False
-        for prop in ('Name','Size','Bold','Italic','Underline'):
+            pass
+        for prop, label in [('Name','字体'), ('Size','字号'), ('Bold','加粗'), ('Italic','斜体'), ('Underline','下划线')]:
             try:
-                if getattr(old_r.Font, prop) != getattr(new_r.Font, prop): return False
+                ov = getattr(old_r.Font, prop)
+                nv = getattr(new_r.Font, prop)
+                if ov != nv: changes.append(f"{label}: {ov} → {nv}")
             except Exception:
                 pass
-        return True
-
+        return "; ".join(changes) if changes else ""
     def _cmp_border_com(self, old_r, new_r):
+        """返回差异描述或空字符串(一致)"""
+        changes = []
+        edge_names = {7:'左', 8:'右', 9:'顶', 10:'底'}
         for edge_id in (7, 8, 9, 10):
             try:
                 ob = old_r.Borders(edge_id)
                 nb = new_r.Borders(edge_id)
-                if ob.LineStyle != nb.LineStyle: return False
+                if ob.LineStyle != nb.LineStyle:
+                    changes.append(f"{edge_names.get(edge_id,edge_id)}边框样式: {ob.LineStyle} → {nb.LineStyle}")
                 if ob.LineStyle != -4142:
-                    if self._ole_to_rgb(ob.Color) != self._ole_to_rgb(nb.Color): return False
-                    if abs(ob.Weight - nb.Weight) > 0.01: return False
+                    try:
+                        oc = self._ole_to_rgb(ob.Color)
+                        nc = self._ole_to_rgb(nb.Color)
+                        if oc != nc: changes.append(f"{edge_names.get(edge_id,edge_id)}边框颜色: RGB:{oc:06X} → RGB:{nc:06X}")
+                    except Exception:
+                        pass
+                    try:
+                        if abs(ob.Weight - nb.Weight) > 0.01:
+                            changes.append(f"{edge_names.get(edge_id,edge_id)}边框粗细: {ob.Weight} → {nb.Weight}")
+                    except Exception:
+                        pass
             except Exception:
                 pass
-        return True
-
+        return "; ".join(changes) if changes else ""
     def _cmp_numfmt_com(self, old_r, new_r):
+        """返回差异描述或空字符串(一致)"""
         try:
-            return old_r.NumberFormat == new_r.NumberFormat
+            of = old_r.NumberFormat
+            nf = new_r.NumberFormat
+            if of != nf: return f"数字格式: {format_numfmt_readable(of)} → {format_numfmt_readable(nf)}"
         except Exception:
-            return False
-
+            pass
+        return ""
     def _cmp_rowheight_com(self, old_r, new_r):
+        """返回差异描述或空字符串(一致)"""
         try:
-            return abs(old_r.RowHeight - new_r.RowHeight) < 0.01
+            oh = old_r.RowHeight
+            nh = new_r.RowHeight
+            if abs(oh - nh) > 0.01: return f"行高: {oh} → {nh}"
         except Exception:
-            return False
-
+            pass
+        return ""
     def _cmp_colwidth_com(self, old_r, new_r):
+        """返回差异描述或空字符串(一致)"""
         try:
-            return abs(old_r.EntireColumn.Width - new_r.EntireColumn.Width) < 0.01
+            ow = old_r.EntireColumn.Width
+            nw = new_r.EntireColumn.Width
+            if abs(ow - nw) > 0.01: return f"列宽: {ow} → {nw}"
         except Exception:
-            return False
-
+            pass
+        return ""
     def _cmp_align_com(self, old_r, new_r):
-        for prop in ('HorizontalAlignment','VerticalAlignment','WrapText'):
+        """返回差异描述或空字符串(一致)"""
+        changes = []
+        prop_labels = {'HorizontalAlignment':'水平对齐', 'VerticalAlignment':'垂直对齐', 'WrapText':'自动换行'}
+        for prop, label in prop_labels.items():
             try:
-                if getattr(old_r, prop) != getattr(new_r, prop): return False
+                ov = getattr(old_r, prop)
+                nv = getattr(new_r, prop)
+                if ov != nv: changes.append(f"{label}: {ov} → {nv}")
             except Exception:
                 pass
-        return True
-
-# 对话框与 GUI
+        return "; ".join(changes) if changes else ""
 class CheckOptionsDialog(tb.Toplevel):
     def __init__(self,parent,current_options,com_on=True):
         super().__init__(parent); self.title("检测项目设置"); self.resizable(False,False); self.transient(parent); self.grab_set(); self.result=None; self.vars={}
@@ -2369,20 +2565,25 @@ class DiffViewer:
         top=tb.Frame(toolbar); top.grid(row=0,column=0,rowspan=2,sticky='ns',padx=(2,2),pady=1)
         top_in=tb.Frame(top); top_in.pack(anchor='center')
         tb.Label(top_in,text="置顶").pack(anchor='center'); tb.Checkbutton(top_in,variable=self.topmost,command=self.toggle_topmost,bootstyle="round-toggle").pack(anchor='center')
-        self.start_btn=tb.Button(toolbar,text="常规差异\n对比",bootstyle=INFO,width=9,command=self.start_compare); self.start_btn.grid(row=0,column=1,rowspan=2,sticky='nsew',padx=2,pady=1)
+        self.start_btn=tb.Button(toolbar,text="常规差异\n逐行对比",bootstyle=INFO,width=10,command=self.start_compare); self.start_btn.grid(row=0,column=1,rowspan=2,sticky='nsew',padx=2,pady=1)
         self.config_btn=tb.Button(toolbar,text="高级\n审核",bootstyle="outline-primary",width=7,command=self.load_check_project); self.config_btn.grid(row=0,column=2,rowspan=2,sticky='nsew',padx=2,pady=1)
         self.project_btn=tb.Button(toolbar,text="高级审核\n规则配置",bootstyle="outline-primary",width=9,command=self.open_project_dialog); self.project_btn.grid(row=0,column=3,rowspan=2,sticky='nsew',padx=2,pady=1)
         self.settings_btn=tb.Button(toolbar,text="常规差异\n检测设置",bootstyle="outline",width=9,command=self.open_check_options); self.settings_btn.grid(row=0,column=4,rowspan=2,sticky='nsew',padx=2,pady=1)
         tb.Separator(toolbar,orient='vertical').grid(row=0,column=5,rowspan=2,sticky='ns',padx=8)
         path_frame=tb.Frame(toolbar); path_frame.grid(row=0,column=6,rowspan=2,sticky='nsew',padx=(0,10)); path_frame.columnconfigure(1,weight=1)
-        tb.Label(path_frame,text="参考报告:").grid(row=0,column=0,sticky='w',padx=(0,5),pady=2); self.old_entry=tb.Entry(path_frame,textvariable=self.old_path); self.old_entry.grid(row=0,column=1,sticky='ew',pady=2); tb.Button(path_frame,text="浏览",bootstyle="outline-primary",width=6,command=lambda:self.browse(self.old_path)).grid(row=0,column=2,padx=(5,0),pady=2)
-        tb.Label(path_frame,text="待检报告:").grid(row=1,column=0,sticky='w',padx=(0,5),pady=2); self.new_entry=tb.Entry(path_frame,textvariable=self.new_path); self.new_entry.grid(row=1,column=1,sticky='ew',pady=2); tb.Button(path_frame,text="浏览",bootstyle="outline-primary",width=6,command=lambda:self.browse(self.new_path)).grid(row=1,column=2,padx=(5,0),pady=2)
+        # 状态徽章 + Entry + 浏览按钮（Canvas 圆角徽章）
+        self.old_status=self._make_badge(path_frame); self.old_status.grid(row=0,column=0,padx=(0,4),pady=2); self.old_status.bind('<Button-1>',self._on_status_click)
+        self.old_entry=tb.Entry(path_frame,foreground='#adb5bd'); self.old_entry.grid(row=0,column=1,sticky='ew',pady=2); tb.Button(path_frame,text="浏览",bootstyle="outline-primary",width=6,command=lambda:self.browse(self.old_path)).grid(row=0,column=2,padx=(5,0),pady=2)
+        self.new_status=self._make_badge(path_frame); self.new_status.grid(row=1,column=0,padx=(0,4),pady=2); self.new_status.bind('<Button-1>',self._on_status_click)
+        self.new_entry=tb.Entry(path_frame,foreground='#adb5bd'); self.new_entry.grid(row=1,column=1,sticky='ew',pady=2); tb.Button(path_frame,text="浏览",bootstyle="outline-primary",width=6,command=lambda:self.browse(self.new_path)).grid(row=1,column=2,padx=(5,0),pady=2)
+        self._set_badge(self.old_status,False); self._set_badge(self.new_status,False)
+        self._setup_path_placeholder()
         toolbar.columnconfigure(6,weight=1)
         self.progress=tb.Progressbar(root,mode='determinate',bootstyle="success"); self.progress.pack(fill='x',padx=5,pady=(0,5))
         tree_frame=tb.Frame(root,padding=(5,0)); tree_frame.pack(fill='both',expand=True); tree_frame.columnconfigure(0,weight=1); tree_frame.rowconfigure(0,weight=1)
         self.tree=tb.Treeview(tree_frame,columns=('action','address','type'),show='tree headings',bootstyle=PRIMARY)
         self.tree.heading('#0',text='Sheet / 差异项'); self.tree.heading('action',text='收起',command=self._toggle_all_nodes); self.tree.heading('address',text='位置'); self.tree.heading('type',text='类型')
-        self.tree.column('#0',width=250,minwidth=200); self.tree.column('action',width=60,minwidth=60,anchor='center',stretch=False); self.tree.column('address',width=130,minwidth=0,anchor='center',stretch=True); self.tree.column('type',width=140,minwidth=0,anchor='center',stretch=True)
+        self.tree.column('#0',width=340,minwidth=200); self.tree.column('action',width=60,minwidth=60,anchor='center',stretch=False); self.tree.column('address',width=90,minwidth=0,anchor='center',stretch=False); self.tree.column('type',width=90,minwidth=0,anchor='center',stretch=False)
         self.tree.tag_configure('sheet',foreground='blue'); self.tree.tag_configure('warning_sheet',foreground='red'); self.tree.tag_configure('com_fail',foreground='red')
         try:
             self.root.option_add('*TScrollbar.width',22)
@@ -2400,8 +2601,8 @@ class DiffViewer:
         self.tree.configure(yscrollcommand=sb.set); self.tree.grid(row=0,column=0,sticky='nsew'); sb.grid(row=0,column=1,sticky='ns')
         self.tree.bind('<<TreeviewSelect>>',self.on_tree_select); self.tree.bind('<Double-1>',self.on_tree_double_click); self.tree.bind('<Button-1>',self.on_tree_click)
         bottom=tb.Frame(root,padding=5); bottom.pack(fill='x'); bottom.columnconfigure(0,weight=0); bottom.columnconfigure(1,weight=1)
-        df=tb.Labelframe(bottom,text="差异详情",padding=5,bootstyle=INFO); df.grid(row=0,column=0,sticky='nsew',padx=(0,3)); df.columnconfigure(0,weight=1); df.rowconfigure(0,weight=1); self.detail=tk.Text(df,width=42,height=6,wrap='word',font=("微软雅黑",9),bg='#ffffff',fg='#212529',relief='flat',highlightthickness=1,highlightbackground='#dee2e6',highlightcolor='#0d6efd',padx=5,pady=5); self.detail.grid(row=0,column=0,sticky='nsew'); detail_sb=tb.Scrollbar(df,orient='vertical',command=self.detail.yview,bootstyle="round"); self.detail.configure(yscrollcommand=detail_sb.set); detail_sb.grid(row=0,column=1,sticky='ns')
-        lf=tb.Labelframe(bottom,text="日志",padding=5,bootstyle=SECONDARY); lf.grid(row=0,column=1,sticky='nsew',padx=(3,0)); lf.columnconfigure(0,weight=1); lf.rowconfigure(0,weight=1); self.log_text=tk.Text(lf,height=6,wrap='word',font=("微软雅黑",9),bg='#ffffff',fg='#212529',relief='flat',highlightthickness=1,highlightbackground='#dee2e6',highlightcolor='#0d6efd',padx=5,pady=5); self.log_text.grid(row=0,column=0,sticky='nsew'); log_sb=tb.Scrollbar(lf,orient='vertical',command=self.log_text.yview,bootstyle="round"); self.log_text.configure(yscrollcommand=log_sb.set); log_sb.grid(row=0,column=1,sticky='ns')
+        df=tb.Labelframe(bottom,text="差异详情",padding=5,bootstyle=INFO); df.grid(row=0,column=0,sticky='nsew',padx=(0,3)); df.columnconfigure(0,weight=1); df.rowconfigure(0,weight=1); self.detail=tk.Text(df,width=42,height=7,wrap='word',font=("微软雅黑",9),bg='#ffffff',fg='#212529',relief='flat',highlightthickness=1,highlightbackground='#dee2e6',highlightcolor='#0d6efd',padx=5,pady=5); self.detail.grid(row=0,column=0,sticky='nsew'); detail_sb=tb.Scrollbar(df,orient='vertical',command=self.detail.yview,bootstyle="round"); self.detail.configure(yscrollcommand=detail_sb.set); detail_sb.grid(row=0,column=1,sticky='ns')
+        lf=tb.Labelframe(bottom,text="日志",padding=5,bootstyle=SECONDARY); lf.grid(row=0,column=1,sticky='nsew',padx=(3,0)); lf.columnconfigure(0,weight=1); lf.rowconfigure(0,weight=1); self.log_text=tk.Text(lf,height=7,wrap='word',font=("微软雅黑",9),bg='#ffffff',fg='#212529',relief='flat',highlightthickness=1,highlightbackground='#dee2e6',highlightcolor='#0d6efd',padx=5,pady=5); self.log_text.grid(row=0,column=0,sticky='nsew'); log_sb=tb.Scrollbar(lf,orient='vertical',command=self.log_text.yview,bootstyle="round"); self.log_text.configure(yscrollcommand=log_sb.set); log_sb.grid(row=0,column=1,sticky='ns')
         # 日志着色 tag
         self.log_text.tag_configure('ts',foreground='#9aa0a6',font=("微软雅黑",8))
         self.log_text.tag_configure('log_ok',foreground='#198754')
@@ -2446,6 +2647,77 @@ class DiffViewer:
             try: self._tip_win.destroy()
             except Exception: pass
             self._tip_win=None
+    def _make_badge(self,parent):
+        """创建圆角徽章 Canvas（26x26，背景跟随 ttk Frame 主题色）"""
+        try:
+            bg = ttk.Style().lookup('TFrame','background') or '#ffffff'
+        except Exception:
+            bg = '#ffffff'
+        c=tk.Canvas(parent,width=26,height=26,bg=bg,highlightthickness=0,cursor='hand2')
+        return c
+    def _draw_badge(self,canvas,text,color):
+        """在 Canvas 上绘制圆角矩形+符号"""
+        canvas.delete('all')
+        r=7; x1,y1,x2,y2=2,2,24,24
+        # 圆角矩形：4 个角用 arc，中间用矩形填充
+        canvas.create_arc(x1,y1,x1+2*r,y1+2*r,start=90,extent=90,fill=color,outline=color,style='pieslice')
+        canvas.create_arc(x2-2*r,y1,x2,y1+2*r,start=0,extent=90,fill=color,outline=color,style='pieslice')
+        canvas.create_arc(x2-2*r,y2-2*r,x2,y2,start=270,extent=90,fill=color,outline=color,style='pieslice')
+        canvas.create_arc(x1,y2-2*r,x1+2*r,y2,start=180,extent=90,fill=color,outline=color,style='pieslice')
+        canvas.create_rectangle(x1+r,y1,x2-r,y2,fill=color,outline=color)
+        canvas.create_rectangle(x1,y1+r,x2,y2-r,fill=color,outline=color)
+        canvas.create_text(13,13,text=text,fill='white',font=('Segoe UI Symbol',11))
+    def _set_badge(self,status_widget,ok):
+        """切换徽章状态：ok=True 绿色✔，False 橙色!（flatly 色系）"""
+        if ok: self._draw_badge(status_widget,'\u2714','#18BC9C')
+        else:  self._draw_badge(status_widget,'!','#F39C12')
+    def _setup_path_placeholder(self):
+        """Entry placeholder + 状态徽章联动（不绑定 textvariable，手动同步避免占位文字回写 var 误触发徽章）"""
+        def _bind(entry, var, badge, ph):
+            def refresh_badge():
+                self._set_badge(badge, bool(var.get()))
+            def focus_in(ev):
+                if not var.get():
+                    entry.delete(0,'end'); entry.configure(foreground='#212529')
+            def focus_out(ev):
+                val=entry.get().strip()
+                if val:
+                    var.set(val); entry.configure(foreground='#212529')
+                elif var.get():
+                    entry.delete(0,'end'); entry.insert(0,var.get()); entry.configure(foreground='#212529')
+                else:
+                    entry.delete(0,'end'); entry.insert(0,ph); entry.configure(foreground='#adb5bd')
+                refresh_badge()
+            def var_trace(*_):
+                if var.get():
+                    entry.delete(0,'end'); entry.insert(0,var.get()); entry.configure(foreground='#212529')
+                elif self.root.focus_get() is not entry:
+                    entry.delete(0,'end'); entry.insert(0,ph); entry.configure(foreground='#adb5bd')
+                refresh_badge()
+            entry.bind('<FocusIn>', focus_in)
+            entry.bind('<FocusOut>', focus_out)
+            var.trace_add('write', var_trace)
+            entry.insert(0, ph); entry.configure(foreground='#adb5bd')
+            self._set_badge(badge, False)
+        _bind(self.old_entry, self.old_path, self.old_status, '请选择参考文件...')
+        _bind(self.new_entry, self.new_path, self.new_status, '请选择待检文件...')
+    def _on_status_click(self, event):
+        """点击状态徽章：已导入→打开文件，未导入→提示"""
+        widget = event.widget
+        if widget == self.old_status:
+            path = self.old_path.get()
+            if not path:
+                messagebox.showinfo("提示", "请先导入参考报告文件")
+            else:
+                try: os.startfile(path)
+                except Exception as e: messagebox.showerror("错误", f"无法打开文件: {e}")
+        elif widget == self.new_status:
+            path = self.new_path.get()
+            if not path:
+                messagebox.showinfo("提示", "请先导入待检报告文件")
+            else:
+                try: os.startfile(path)
+                except Exception as e: messagebox.showerror("错误", f"无法打开文件: {e}")
     def _raise_modal(self):
         w=getattr(self,'_active_modal',None)
         try:
@@ -2481,7 +2753,7 @@ class DiffViewer:
         finally:
             self._active_modal=None; self._modal_busy=False
     def clear_check_project(self):
-        self.check_project=None; self.start_btn.configure(text="常规差异\n对比",bootstyle=INFO,command=self.start_compare,width=9); self.settings_btn.configure(state='normal'); self.config_btn.configure(text="高级\n审核",bootstyle="outline-primary",width=7,command=self.load_check_project); self.project_btn.configure(text="高级审核\n规则配置",command=self.open_project_dialog); self.tree.delete(*self.tree.get_children()); self.detail.delete('1.0','end'); self.diff_items=[]; self.result_data=None; self.log("已退出规则检查模式，恢复常规差异对比")
+        self.check_project=None; self.start_btn.configure(text="常规差异\n逐行对比",bootstyle=INFO,command=self.start_compare,width=10); self.settings_btn.configure(state='normal'); self.config_btn.configure(text="高级\n审核",bootstyle="outline-primary",width=7,command=self.load_check_project); self.project_btn.configure(text="高级审核\n规则配置",command=self.open_project_dialog); self.tree.delete(*self.tree.get_children()); self.detail.delete('1.0','end'); self.diff_items=[]; self.result_data=None; self.log("已退出规则检查模式，恢复常规差异对比")
     def load_check_project(self):
         if self._modal_busy: self._raise_modal(); return
         self._modal_busy=True
@@ -2498,7 +2770,7 @@ class DiffViewer:
         if '✗' in msg or '✕' in msg: return 'log_bad'
         if any(k in msg for k in ('异常','失败','错误','无法','跳过复核')): return 'log_bad'
         if '✓' in msg or '✔' in msg: return 'log_ok'
-        if any(k in msg for k in ('高级审核完成','解析完成','检查总计耗时','对比阶段耗时','开始新的检查')): return 'log_bold'
+        if any(k in msg for k in ('高级审核完成','解析完成','检查总计耗时','对比阶段耗时')): return 'log_bold'
         return None
 
     def _insert_summary_line(self,msg):
@@ -2596,7 +2868,7 @@ class DiffViewer:
         if self.com_verify.get() and not self._prep_advanced_audit(old,new): return
         self.stop_event.clear(); self.start_btn.configure(text="停止检查",bootstyle="danger",command=self.stop_compare)
         for b in (self.project_btn,self.config_btn,self.settings_btn): b.configure(state='disabled')
-        self.tree.delete(*self.tree.get_children()); self.detail.delete('1.0','end'); self.diff_items=[]; self.log("="*10+" 开始新的检查 "+"="*10)
+        self.tree.delete(*self.tree.get_children()); self.detail.delete('1.0','end'); self.diff_items=[]; self.log_text.insert('end',"="*10+" 开始新的检查 "+"="*10+'\n','log_blue_bold'); self.log_text.see('end')
         current_opts=dict(self.check_options); pm=self.plugin_manager; cp=self.check_project; tol=self.color_tolerance.get(); do_com=self.com_verify.get()
         def worker():
             comparer=None; compare_t0=time.time()
@@ -2625,8 +2897,8 @@ class DiffViewer:
             name=self.check_project.project_name or ''
             dw=sum(2 if ord(ch)>0x2e7f else 1 for ch in name)
             w=max(10,min(22,dw+6))
-            self.start_btn.configure(text=f"规则检查\n（{name}）",width=w)
-        else: self.start_btn.configure(text="常规差异\n对比",width=9)
+            self.start_btn.configure(text=f"[{name}]",width=w)
+        else: self.start_btn.configure(text="常规差异\n逐行对比",width=10)
     def on_comparison_finished(self):
         self._set_start_btn_text(); self.start_btn.configure(bootstyle=INFO,command=self.start_compare)
         self.start_btn.configure(state='normal'); self.project_btn.configure(state='normal'); self.config_btn.configure(state='normal')
@@ -2754,8 +3026,10 @@ class DiffViewer:
             if d.get('rule_name'):
                 lines.append(f"规则: {d['rule_name']}")
                 if d.get('rule_expect'): lines.append(f"期望: {d['rule_expect']}")
-                lines.append(f"结果: {'已豁免' if d.get('rule_pass') else '未豁免'}")
-            if d.get('com_confirmed'): lines.append("COM复核: 确认差异")
+                diff_desc=d.get('rule_diff_desc'); lines.append(f"结果: {diff_desc if diff_desc else ('一致' if d.get('rule_pass') else '存在差异')}")
+            if d.get('com_confirmed'):
+                com_desc = d.get('com_diff_desc', '')
+                lines.append(f"复核: {com_desc}" if com_desc else "复核: 确认差异")
             self.detail.delete('1.0','end'); self.detail.insert('1.0','\n'.join(lines))
     def on_tree_click(self,event):
         if self.tree.identify_region(event.x,event.y)!='cell': return
